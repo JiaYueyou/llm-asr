@@ -190,6 +190,14 @@ def query_gpu_free_mb(device_id: int = 0) -> Optional[float]:
     return total - used
 
 
+def query_gpu_mem_mb(device_id: int = 0) -> Optional[tuple]:
+    """nvidia-smi 口径的 (total, used) 显存（MB）；失败返回 None。
+
+    基线口径换算用：启动前空闲 baseline_free → 启动前已用 = total - baseline_free。
+    """
+    return _query_gpu_mem_fields(device_id)
+
+
 def query_gpu_used_mb(device_id: int = 0) -> Optional[float]:
     """nvidia-smi 口径的已用显存（MB）；失败返回 None。
 
@@ -202,6 +210,39 @@ def query_gpu_used_mb(device_id: int = 0) -> Optional[float]:
         return None
     _, used = fields
     return used
+
+
+def query_process_vram_mb(pid: int) -> Optional[float]:
+    """nvidia-smi compute-apps 口径的单进程显存（MB）；失败/未列出返回 None。
+
+    用于进程外后端（llama-server）的显存统计：模型在评测脚本启动前
+    就已加载，脚本内"推理前后差分"会漏计权重显存——必须抓进程本身
+    的占用（权重 + KV cache 全量口径）。
+    注意 WSL2 下 nvidia-smi 常看不到 Windows 侧进程；Linux 侧进程
+    （llama-server 跑在 WSL 内）可以正常列出。
+    """
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                f"--id=0",
+                "--query-compute-apps=pid,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        ).stdout.strip()
+        for line in out.splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 2 and parts[0] == str(pid):
+                return float(parts[1])
+        return None  # 进程未在 compute-apps 列出（未用 GPU 或已退出）
+    except Exception:  # noqa: BLE001 - 任何失败都按"不可用"处理
+        return None
 
 
 def _query_gpu_mem_fields(

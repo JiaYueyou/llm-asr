@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import json  # noqa: F401 - payload/timings 断言用
 import subprocess  # noqa: F401 - monkeypatch CompletedProcess 用
 import sys
+import urllib.error  # noqa: F401 - server 异常测试用
 from pathlib import Path
 
 import pytest
@@ -148,7 +150,7 @@ class TestLlamaCppBackend:
         args = b._build_cli_args("hello", 32)
         assert args[0] == str(b.bin_path)
         # 确定性红线 7.2：temp=0 + repeat-penalty 显式传入
-        assert "--temp" in args and args[args.index("--temp") + 1] == "0"
+        assert args[args.index("--temp") + 1] == "0.0"
         assert (
             "--repeat-penalty" in args
             and args[args.index("--repeat-penalty") + 1] == "1.10"
@@ -173,26 +175,31 @@ class TestLlamaCppBackend:
         b = LlamaCppBackend(
             server_url="http://127.0.0.1:8080", repeat_penalty=1.1
         )
-        payload = b._build_request_payload("hi", 16, 1.1)
+        payload = b._build_request_payload("hi", 16, temperature=0.0, repeat_penalty=1.1)
         assert payload["temperature"] == 0.0
         assert payload["n_predict"] == 16
         assert payload["repeat_penalty"] == 1.1
         assert payload["stream"] is False
+        # 显式控制项（cache_prompt 默认关 / seed / stop）
+        assert payload["cache_prompt"] is False
+        assert payload["seed"] == 42
+        assert payload["stop"] == ["<|im_end|>", "<|endoftext|>"]
 
     def test_server_response_parse(self):
+        """新版 timings（predicted_* + cache_n）解析。"""
         data = {
             "content": "corrected text",
             "timings": {
-                "prompt_n": 120, "prompt_ms": 600.0,
-                "eval_n": 8, "eval_ms": 400.0,
+                "prompt_n": 100, "prompt_ms": 500.0, "cache_n": 20,
+                "predicted_n": 8, "predicted_ms": 400.0,
             },
         }
         r = LlamaCppBackend._parse_server_response(data, "p" * 400)
         assert r.text == "corrected text"
-        assert r.prompt_tokens == 120
+        assert r.prompt_tokens == 120  # prompt_n + cache_n
         assert r.completion_tokens == 8
-        # TTFT ≈ prompt_ms + eval_ms/eval_n = 600 + 400/8 = 650
-        assert r.ttft_ms == pytest.approx(650.0)
+        # TTFT ≈ prompt_ms + predicted_ms/predicted_n = 500 + 400/8
+        assert r.ttft_ms == pytest.approx(550.0)
 
     def test_server_response_degraded(self):
         # timings 缺失：降级为启发式 token 数，ttft=None
@@ -243,10 +250,263 @@ class TestLlamaCppBackend:
         with pytest.raises(RuntimeError, match="退出码 1"):
             b.generate("p", max_new_tokens=4)
 
-    def test_count_tokens_heuristic(self):
+    def test_count_tokens_heuristic(self, monkeypatch):
+        """server 模式 /tokenize 失败（网络异常）时回落 len//4 启发式。"""
+        import common.llm_backends.llamacpp_custom as lc
+
         b = LlamaCppBackend(server_url="http://h:8080")
-        assert b.count_tokens("a" * 40) == 10  # len//4
-        assert b.count_tokens("") == 1
+
+        def fake_urlopen(req, *a, **kw):
+            raise urllib.error.URLError("conn refused")
+
+        monkeypatch.setattr(lc.urllib.request, "urlopen", fake_urlopen)
+        assert b.count_tokens("a" * 40) == 10  # len//4 回落
+
+    def test_count_tokens_server_tokenize(self):
+        """server 模式无 tokenizer_ref 时走 POST /tokenize 精确计数。"""
+        import urllib.request as urlreq
+
+        import common.llm_backends.llamacpp_custom as lc
+
+        b = LlamaCppBackend(server_url="http://h:8080")
+        captured = {}
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b'{"tokens": [1, 2, 3, 4, 5]}'
+
+        def fake_urlopen(req, *a, **kw):
+            captured["url"] = req.full_url
+            captured["body"] = json.loads(req.data.decode())
+            return _Resp()
+
+        orig = urlreq.urlopen
+        lc.urllib.request.urlopen = fake_urlopen
+        try:
+            assert b.count_tokens("hello") == 5
+            assert captured["url"] == "http://h:8080/tokenize"
+            assert captured["body"] == {"content": "hello"}
+        finally:
+            lc.urllib.request.urlopen = orig
+
+    # ------------------------------------------------ server 模式 generate
+    def _patch_urlopen(self, monkeypatch, resp_factory):
+        import common.llm_backends.llamacpp_custom as lc
+
+        monkeypatch.setattr(lc.urllib.request, "urlopen", resp_factory)
+
+    def test_generate_server_full_flow(self, monkeypatch):
+        """server 模式全链路：payload 透传 + 真实 timings（predicted_*）解析。"""
+        import common.llm_backends.llamacpp_custom as lc
+
+        b = LlamaCppBackend(server_url="http://h:8080", cache_prompt=True)
+        b._loaded = True  # 跳过 /health 探测（本测试聚焦 /completion 链路）
+        captured = {}
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "content": "corrected text",
+                    "timings": {
+                        "prompt_n": 100, "prompt_ms": 500.0, "cache_n": 20,
+                        "predicted_n": 8, "predicted_ms": 400.0,
+                    },
+                }).encode()
+
+        def fake_urlopen(req, *a, **kw):
+            captured["url"] = req.full_url
+            captured["payload"] = json.loads(req.data.decode())
+            return _Resp()
+
+        monkeypatch.setattr(lc.urllib.request, "urlopen", fake_urlopen)
+        r = b.generate("prompt", max_new_tokens=16, temperature=0.0,
+                       repetition_penalty=1.2)
+        assert captured["url"] == "http://h:8080/completion"
+        p = captured["payload"]
+        # 参数透传 + 显式控制项
+        assert p["temperature"] == 0.0
+        assert p["repeat_penalty"] == 1.2
+        assert p["cache_prompt"] is True
+        assert p["seed"] == 42
+        assert p["stop"] == ["<|im_end|>", "<|endoftext|>"]
+        assert p["n_predict"] == 16
+        # timings：prompt_tokens = prompt_n + cache_n = 120；TTFT = 500+400/8
+        assert r.text == "corrected text"
+        assert r.prompt_tokens == 120
+        assert r.completion_tokens == 8
+        assert r.ttft_ms == pytest.approx(550.0)
+
+    def test_generate_server_rep_fallback(self, monkeypatch):
+        """repetition_penalty 未传（None）回落 self.repeat_penalty（1.10）。"""
+        import common.llm_backends.llamacpp_custom as lc
+
+        b = LlamaCppBackend(server_url="http://h:8080", repeat_penalty=1.05)
+        b._loaded = True  # 跳过 /health 探测
+        captured = {}
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b'{"content": "x"}'
+
+        def fake_urlopen(req, *a, **kw):
+            captured["payload"] = json.loads(req.data.decode())
+            return _Resp()
+
+        monkeypatch.setattr(lc.urllib.request, "urlopen", fake_urlopen)
+        b.generate("p", max_new_tokens=4)  # 不传 repetition_penalty
+        assert captured["payload"]["repeat_penalty"] == 1.05
+
+    def test_generate_server_urlerror(self, monkeypatch):
+        """网络断连（URLError）报带端点与超时信息的 RuntimeError。"""
+        import common.llm_backends.llamacpp_custom as lc
+
+        b = LlamaCppBackend(server_url="http://h:8080")
+        b._loaded = True  # 跳过 /health 探测
+
+        def fake_urlopen(req, *a, **kw):
+            raise urllib.error.URLError("connection refused")
+
+        monkeypatch.setattr(lc.urllib.request, "urlopen", fake_urlopen)
+        with pytest.raises(RuntimeError, match="completion.*connection refused"):
+            b.generate("p", max_new_tokens=4)
+
+    def test_generate_server_timeout(self, monkeypatch):
+        """超时（TimeoutError）同样转为带端点信息的 RuntimeError。"""
+        import common.llm_backends.llamacpp_custom as lc
+
+        b = LlamaCppBackend(server_url="http://h:8080", timeout_s=1.5)
+        b._loaded = True  # 跳过 /health 探测
+
+        def fake_urlopen(req, *a, **kw):
+            raise TimeoutError("timed out")
+
+        monkeypatch.setattr(lc.urllib.request, "urlopen", fake_urlopen)
+        with pytest.raises(RuntimeError, match="超时 1.5s"):
+            b.generate("p", max_new_tokens=4)
+
+    def test_server_response_legacy_eval_fallback(self):
+        """旧版 llama-server timings（eval_n/eval_ms）兼容 fallback。"""
+        data = {
+            "content": "old text",
+            "timings": {
+                "prompt_n": 120, "prompt_ms": 600.0,
+                "eval_n": 8, "eval_ms": 400.0,
+            },
+        }
+        r = LlamaCppBackend._parse_server_response(data, "p" * 400)
+        assert r.text == "old text"
+        assert r.prompt_tokens == 120
+        assert r.completion_tokens == 8
+        assert r.ttft_ms == pytest.approx(650.0)  # 600 + 400/8
+
+    def test_server_response_degraded(self):
+        # timings 缺失：降级为启发式 token 数，ttft=None
+        data = {"content": "abcd"}
+        r = LlamaCppBackend._parse_server_response(data, "p" * 40)
+        assert r.completion_tokens == 1  # len//4
+        assert r.ttft_ms is None
+        # prompt_n+cache_n 均为 0 时 prompt_tokens 也降级
+        data2 = {"content": "x", "timings": {"prompt_ms": 5.0}}
+        r2 = LlamaCppBackend._parse_server_response(data2, "p" * 40)
+        assert r2.prompt_tokens == 10  # len//4
+
+    def test_health_503_model_loading(self, monkeypatch):
+        """_load() 探测 /health 503 时明确提示模型仍在加载。"""
+        import common.llm_backends.llamacpp_custom as lc
+
+        b = LlamaCppBackend(server_url="http://h:8080")
+
+        class _HTTPError(urllib.error.HTTPError):
+            def __init__(self):
+                super().__init__("http://h:8080/health", 503, "loading", None, None)
+
+        def fake_urlopen(req, *a, **kw):
+            raise _HTTPError()
+
+        monkeypatch.setattr(lc.urllib.request, "urlopen", fake_urlopen)
+        with pytest.raises(RuntimeError, match="503.*仍在加载"):
+            b._load()
+
+    def test_health_conn_refused(self, monkeypatch):
+        """server 未启动（连接拒绝）报未就绪并提示确认端口。"""
+        import common.llm_backends.llamacpp_custom as lc
+
+        b = LlamaCppBackend(server_url="http://h:9999")
+
+        def fake_urlopen(req, *a, **kw):
+            raise urllib.error.URLError("refused")
+
+        monkeypatch.setattr(lc.urllib.request, "urlopen", fake_urlopen)
+        with pytest.raises(RuntimeError, match="无法连接.*9999"):
+            b._load()
+
+    # ------------------------------------------------ CLI 模式补充
+    def test_cli_args_passthrough_and_controls(self, tmp_path):
+        """generate() 传入的 temperature/rep 透传 CLI；seed/stop 显式携带。"""
+        b = self._cli_backend(tmp_path)  # seed=42 默认
+        args = b._build_cli_args("hi", 16, temperature=0.3, repetition_penalty=1.25)
+        assert args[args.index("--temp") + 1] == "0.3"
+        assert args[args.index("--repeat-penalty") + 1] == "1.25"
+        assert args[args.index("-s") + 1] == "42"
+        assert args[args.index("-r") + 1] == "<|im_end|>"  # 首个停用词
+        # 自定义 stop/seed
+        b2 = LlamaCppBackend(
+            model_path=tmp_path / "m.gguf", bin_path=tmp_path / "cli",
+            stop=["END"], seed=7,
+        )
+        (tmp_path / "m.gguf").write_text("g")
+        (tmp_path / "cli").write_text("#!/bin/sh\n")
+        args2 = b2._build_cli_args("hi", 16)
+        assert args2[args2.index("-s") + 1] == "7"
+        assert args2[args2.index("-r") + 1] == "END"
+
+    def test_generate_cli_timeout(self, tmp_path, monkeypatch):
+        """llama-cli 超时转 RuntimeError（含 timeout_s 与二进制路径）。"""
+        import common.llm_backends.llamacpp_custom as lc
+
+        b = self._cli_backend(tmp_path)
+
+        def fake_run(args, **kw):
+            raise subprocess.TimeoutExpired(cmd=args, timeout=b.timeout_s)
+
+        monkeypatch.setattr(lc.subprocess, "run", fake_run)
+        with pytest.raises(RuntimeError, match="超时"):
+            b.generate("p", max_new_tokens=4)
+
+    def test_generate_cli_passthrough(self, tmp_path, monkeypatch):
+        """generate() 的 temperature/rep 透传到 CLI argv（默认 0.0/1.10）。"""
+        import common.llm_backends.llamacpp_custom as lc
+
+        b = self._cli_backend(tmp_path)
+        captured = {}
+
+        def fake_run(args, **kw):
+            captured["args"] = args
+            return subprocess.CompletedProcess(args, 0, stdout="out\n", stderr="")
+
+        monkeypatch.setattr(lc.subprocess, "run", fake_run)
+        b.generate("p", max_new_tokens=4, temperature=0.0, repetition_penalty=1.3)
+        a = captured["args"]
+        assert a[a.index("--temp") + 1] == "0.0"
+        assert a[a.index("--repeat-penalty") + 1] == "1.30"
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +559,58 @@ class TestMockLLMBackend:
     def test_backend_name(self):
         assert MockLLMBackend().backend_name == "mock"
         assert LlamaCppBackend(server_url="http://h:1").backend_name == "llamacpp"
+
+
+# ---------------------------------------------------------------------------
+# profiler 进程级显存查询（llamacpp 外部进程口径）
+# ---------------------------------------------------------------------------
+class TestProcessVramQuery:
+    def test_query_process_vram_found(self, monkeypatch):
+        """compute-apps 列出目标 pid 时返回其显存占用。
+
+        profiler.query_process_vram_mb 内部局部 import subprocess，
+        patch 顶层 subprocess.run 即可生效。
+        """
+        import subprocess as sp
+
+        import common.profiler as prof
+
+        fake_output = "12345, 2357\n67890, 100\n"
+
+        def fake_run(cmd, **kw):
+            class _P:
+                stdout = fake_output
+            return _P()
+
+        monkeypatch.setattr(sp, "run", fake_run)
+        assert prof.query_process_vram_mb(12345) == 2357.0
+        assert prof.query_process_vram_mb(67890) == 100.0
+
+    def test_query_process_vram_missing_pid(self, monkeypatch):
+        """pid 不在列表（进程退出/未用 GPU）返回 None 而非报错。"""
+        import subprocess as sp
+
+        import common.profiler as prof
+
+        def fake_run(cmd, **kw):
+            class _P:
+                stdout = "99999, 500\n"
+            return _P()
+
+        monkeypatch.setattr(sp, "run", fake_run)
+        assert prof.query_process_vram_mb(12345) is None
+
+    def test_query_process_vram_smerror(self, monkeypatch):
+        """nvidia-smi 失败（异常）返回 None。"""
+        import subprocess as sp
+
+        import common.profiler as prof
+
+        def fake_run(cmd, **kw):
+            raise sp.CalledProcessError(1, "nvidia-smi")
+
+        monkeypatch.setattr(sp, "run", fake_run)
+        assert prof.query_process_vram_mb(123) is None
 
 
 # ---------------------------------------------------------------------------

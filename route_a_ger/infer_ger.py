@@ -56,7 +56,9 @@ from common.metrics import (
 from common.profiler import (
     InferenceProfiler,
     current_peak_vram_mb,
+    query_gpu_mem_mb,
     query_gpu_used_mb,
+    query_process_vram_mb,
 )
 from common.text_norm import normalize_for_wer
 from route_a_ger.prompts import (
@@ -72,6 +74,28 @@ logger = logging.getLogger("infer_ger")
 def load_nbest(path: Path, max_samples: int | None = None) -> List[dict]:
     records = [json.loads(l) for l in open(path, encoding="utf-8")]
     return records[:max_samples] if max_samples else records
+
+
+def _query_llamaserver_vram() -> float | None:
+    """pgrep llama-server -> nvidia-smi compute-apps 抓进程显存（MB）。
+
+    llamacpp server 模式的进程级口径：模型权重 + KV cache 全量。
+    pgrep 找不到进程 / nvidia-smi 列不出（WSL2 限制）返回 None。
+    """
+    import subprocess
+
+    try:
+        pids = subprocess.run(
+            ["pgrep", "-f", "llama-server"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout.split()
+    except Exception:  # noqa: BLE001 - pgrep 失败视为不可用
+        return None
+    for pid in pids:
+        v = query_process_vram_mb(int(pid))
+        if v is not None:
+            return v
+    return None
 
 
 # ---------------------------------------------------------------- checkpoint
@@ -128,10 +152,9 @@ def merge_stats(done: dict, stats: dict) -> dict:
         round(total_tokens / total_gen, 2) if total_gen > 0 else 0.0
     )
     hist_vram = done_first_vram(done)
-    merged["peak_vram_mb"] = max(
-        filter(None, [hist_vram, stats.get("peak_vram_mb")]),
-        default=None,
-    )
+    cur_vram = stats.get("peak_vram_mb")
+    vram_vals = [v for v in (hist_vram, cur_vram) if v is not None]
+    merged["peak_vram_mb"] = max(vram_vals) if vram_vals else None
     hist_ttft = _hist_first_ttft(done)
     if hist_ttft is not None:
         merged["ttft"] = hist_ttft
@@ -205,6 +228,11 @@ def main() -> int:
     parser.add_argument(
         "--resume", action="store_true",
         help="断点续跑：从 outputs/<exp_name>/checkpoint.jsonl 跳过已完成样本",
+    )
+    parser.add_argument(
+        "--vram_baseline_mb", type=float, default=None,
+        help="启动 llama-server 前记录的 nvidia-smi 空闲显存（MB）；"
+             "llamacpp 后端显存峰值 = 当前已用 - 基线（含权重全量，最准口径）",
     )
     parser.add_argument(
         "--no_checkpoint", action="store_true",
@@ -285,7 +313,23 @@ def main() -> int:
     ]
     max_new = [dynamic_max_new_tokens(r["nbest"]) for r in records]
 
-    # 进程外后端（llamacpp server）显存差分基线：进入生成前测一次
+    # 进程外后端（llamacpp server）显存口径（三级，取最先可用者）：
+    # ① --vram_baseline_mb：用户在启动 llama-server 前记录的空闲显存，
+    #    峰值 = 当前已用 - 基线（含权重 + KV cache 全量，最准）；
+    # ② server 进程 compute-apps：nvidia-smi 抓 llama-server 进程占用
+    #    （WSL2 下 Linux 侧进程可见；Windows 侧进程不可见）；
+    # ③ 脚本内前后差分：仅反映推理增量，漏计权重（最后兜底）。
+    # 陷阱：llama-server 在本脚本启动前就已加载权重，单纯脚本内差分
+    #       会漏计权重显存 —— 必须用 ① 或 ②。
+    server_vram_mb: float | None = None
+    vram_source = ""
+    if args.backend == "llamacpp" and args.llamacpp_url:
+        if args.vram_baseline_mb is not None:
+            server_vram_mb = None  # 用基线口径，进入生成后按需计算
+            vram_source = "baseline"
+        else:
+            server_vram_mb = _query_llamaserver_vram()
+            vram_source = "process" if server_vram_mb is not None else "diff"
     ext_gpu_base_mb = (
         query_gpu_used_mb()
         if args.backend == "llamacpp" and args.llamacpp_url
@@ -361,18 +405,43 @@ def main() -> int:
                         "进度 %d/%d | tokens=%d", i + 1, len(records),
                         total_completion_tokens,
                     )
-            # 进程外后端显存差分（nvidia-smi 口径，常驻占用在差分中抵消）
-            if ext_gpu_base_mb is not None:
-                cur = query_gpu_used_mb()
-                if cur is not None:
-                    profiler.report_peak_vram(cur - ext_gpu_base_mb)
-                    logger.info(
-                        "llamacpp 进程级显存差分: %.0f MB (base=%.0f)",
-                        cur - ext_gpu_base_mb, ext_gpu_base_mb,
-                    )
     finally:
         if ckpt_fp is not None:
             ckpt_fp.close()
+        # 进程外后端显存统计（三级口径见上方注释，取最先可用者）。
+        # 必须在 track() 退出之后注入：track 的 finally 会用 torch allocator
+        # 读数覆盖 _peak_vram_mb，llamacpp 进程内无 torch 分配，覆盖会丢值。
+        if vram_source == "baseline":
+            fields = query_gpu_mem_mb()
+            if fields is not None:
+                total, used = fields
+                # 基线条目是"启动 server 前的空闲"→ 换算成启动前已用
+                baseline_used = total - args.vram_baseline_mb
+                peak = max(used - baseline_used, 0.0)
+                profiler.report_peak_vram(peak)
+                logger.info(
+                    "llamacpp 显存（基线口径）: 峰值 %.0f MB "
+                    "(当前已用 %.0f - 启动前已用 %.0f)",
+                    peak, used, baseline_used,
+                )
+        elif vram_source == "process":
+            v = _query_llamaserver_vram()
+            if v is not None:
+                # 进程口径已含权重；推理期间 KV cache 增长取两次较大值
+                peak = max(v, server_vram_mb or v)
+                profiler.report_peak_vram(peak)
+                logger.info(
+                    "llamacpp 显存（进程口径）: 峰值 %.0f MB", peak,
+                )
+        elif ext_gpu_base_mb is not None:  # diff 兜底
+            cur = query_gpu_used_mb()
+            if cur is not None:
+                profiler.report_peak_vram(cur - ext_gpu_base_mb)
+                logger.info(
+                    "llamacpp 进程级显存差分: %.0f MB (base=%.0f)"
+                    "（注意：漏计 server 预载权重）",
+                    cur - ext_gpu_base_mb, ext_gpu_base_mb,
+                )
         stats = profiler.finalize(
             total_audio_sec=max(total_audio, 1e-6),
             total_new_tokens=total_completion_tokens,
