@@ -618,12 +618,19 @@ class TestProcessVramQuery:
 # ---------------------------------------------------------------------------
 class TestCheckpointResume:
     def _run_cli(self, args: list, capsys=None):
-        """以子进程跑 infer_ger.py（隔离 sys.argv/全局态，冒烟即真实路径）。"""
+        """以子进程跑 infer_ger.py（隔离 sys.argv/全局态，冒烟即真实路径）。
+
+        强制 HF_HUB_OFFLINE=1：mock 后端虽不下载模型，但 infer_ger 仍需
+        AutoTokenizer 渲染 prompt；transformers 4.57 的 _patch_mistral_regex
+        在未设 OFFLINE 时会发 HEAD 请求，无网环境下重试后直接失败。
+        """
+        import os
         import subprocess as sp
 
         return sp.run(
             [sys.executable, "route_a_ger/infer_ger.py", *args],
             capture_output=True, text=True, timeout=300,
+            env={**os.environ, "HF_HUB_OFFLINE": "1"},
         )
 
     def test_load_checkpoint_corrupt_tail(self, tmp_path):
