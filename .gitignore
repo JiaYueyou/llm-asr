@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Conda / 环境相关
+.conda/
+
+# IDE / Claude Code
+.idea/
+.vscode/
+.claude/settings.local.json
+
+# 实验产物（本地与云端各自生成，不入库）
+outputs/
+
+# 数据清单（含绝对路径，各环境自行生成）
+data/manifests/
+
+# LibriSpeech 原始数据（体积巨大，单独下载）
+data/LibriSpeech/
+data/raw/
+*.flac
+*.tar.gz
+
+# 模型缓存
+*.gguf
+checkpoints/
+hf_cache/
