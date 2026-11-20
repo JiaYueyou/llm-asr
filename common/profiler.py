@@ -173,6 +173,31 @@ def query_gpu_free_mb(device_id: int = 0) -> Optional[float]:
     用于评测前的显存余量检查（本地 4.5GB 安全上限）与
     外部后端的进程级占用统计。
     """
+    free_mb = _query_gpu_mem_fields(device_id)
+    if free_mb is None:
+        return None
+    total, used = free_mb
+    return total - used
+
+
+def query_gpu_used_mb(device_id: int = 0) -> Optional[float]:
+    """nvidia-smi 口径的已用显存（MB）；失败返回 None。
+
+    llama.cpp 等进程外后端的显存统计：评测前后差分
+    （query_gpu_used_mb 之差）注入 profiler.report_peak_vram()。
+    注意 WSL2 下该值含 Windows 侧占用，差分口径可抵消常驻部分。
+    """
+    fields = _query_gpu_mem_fields(device_id)
+    if fields is None:
+        return None
+    _, used = fields
+    return used
+
+
+def _query_gpu_mem_fields(
+    device_id: int = 0,
+) -> Optional[tuple]:
+    """nvidia-smi 查询 (total, used) 显存（MB）；失败返回 None。"""
     import subprocess
 
     try:
@@ -189,6 +214,6 @@ def query_gpu_free_mb(device_id: int = 0) -> Optional[float]:
             check=True,
         ).stdout.strip()
         total, used = (float(x) for x in out.split(","))
-        return total - used
+        return total, used
     except Exception:  # noqa: BLE001 - 任何失败都按"不可用"处理
         return None

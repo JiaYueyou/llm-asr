@@ -13,6 +13,9 @@ venv/
 .vscode/
 .claude/settings.local.json
 
+# 会话交接单（每会话动态更新，不入库；CLAUDE.md 保留追踪）
+TODO_HANDOFF.md
+
 # 实验产物（本地与云端各自生成，不入库）
 outputs/
 

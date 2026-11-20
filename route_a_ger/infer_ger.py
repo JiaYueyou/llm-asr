@@ -8,6 +8,18 @@
     # 三精度全量（test-clean）
     python route_a_ger/infer_ger.py --nbest outputs/nbest/test-clean.jsonl \
         --model Qwen/Qwen3-1.7B --quant_mode fp16
+
+    # WSL2 下 Windows 侧常驻 ~1.4GB 致空闲显存贴着阈值边缘（fp16 峰值实际
+    # ~3.6GB），默认预检放宽到 4.4GB；仍被拒时可用 --max_vram_gb 进一步放宽：
+    python route_a_ger/infer_ger.py ... --quant_mode fp16 --max_vram_gb 4.0
+
+    # 管线冒烟（无 GPU/模型/外部进程；Mock 回显 Top-1，WER 必须等于 beam-1 基线）
+    python route_a_ger/infer_ger.py --nbest outputs/nbest/dev-clean.jsonl \
+        --backend mock --template plain --exp_name ger-mock-dev-clean-50
+
+    # 定制 llama.cpp（server 模式，模型常驻；TTFT/显存差分统计走此模式）
+    python route_a_ger/infer_ger.py --nbest outputs/nbest/dev-clean.jsonl \
+        --backend llamacpp --quant_mode q4_k_m --llamacpp_url http://127.0.0.1:8080
 """
 
 from __future__ import annotations
@@ -21,14 +33,18 @@ from typing import List
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from transformers import AutoTokenizer
+
 from common.llm_backends.hf_bnb import HFBNBackend
+from common.llm_backends.llamacpp_custom import LlamaCppBackend
+from common.llm_backends.mock import MockLLMBackend
 from common.metrics import (
     append_summary_row,
     compute_wer,
     export_error_cases,
     export_predictions,
 )
-from common.profiler import InferenceProfiler
+from common.profiler import InferenceProfiler, query_gpu_used_mb
 from common.text_norm import normalize_for_wer
 from route_a_ger.prompts import (
     SYSTEM_PROMPT,
@@ -54,7 +70,26 @@ def main() -> int:
         "--model", default="Qwen/Qwen3-1.7B", help="HF model id 或本地路径"
     )
     parser.add_argument(
-        "--quant_mode", default="fp16", choices=["fp16", "int8", "nf4"]
+        "--quant_mode", default=None,
+        choices=["fp16", "int8", "nf4", "q8_0", "q4_k_m", "gguf"],
+        help="精度档：hf_bnb 用 fp16/int8/nf4；llamacpp 用 q8_0/q4_k_m/gguf 标注",
+    )
+    parser.add_argument(
+        "--backend", default="hf_bnb",
+        choices=["hf_bnb", "llamacpp", "mock"],
+        help="推理后端：hf_bnb（默认）| llamacpp（定制版）| mock（管线冒烟）",
+    )
+    parser.add_argument(
+        "--llamacpp_bin", type=Path, default=None,
+        help="定制 llama-cli 可执行路径（llamacpp CLI 模式，红线 7.5：CLI 注入不硬编码）",
+    )
+    parser.add_argument(
+        "--llamacpp_url", default=None,
+        help="llama-server 根地址（llamacpp server 模式，如 http://127.0.0.1:8080）",
+    )
+    parser.add_argument(
+        "--gguf_model", type=Path, default=None,
+        help="GGUF 模型路径（llamacpp CLI 模式必须）",
     )
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument(
@@ -72,7 +107,30 @@ def main() -> int:
         "--write_summary", action="store_true",
         help="写入 outputs/metrics/summary.csv",
     )
+    parser.add_argument(
+        "--max_vram_gb", type=float, default=None,
+        help="加载前空闲显存预检阈值（GB）；默认 fp16=4.4、量化档不预检",
+    )
     args = parser.parse_args()
+
+    # quant_mode 语义随后端变化：hf_bnb=bnb 档；llamacpp=GGUF 档标注；mock=仅记录
+    if args.quant_mode is None:
+        args.quant_mode = {"hf_bnb": "fp16", "llamacpp": "gguf", "mock": "fp16"}[
+            args.backend
+        ]
+    if args.backend == "hf_bnb" and args.quant_mode not in ("fp16", "int8", "nf4"):
+        parser.error(f"hf_bnb 后端不支持 quant_mode={args.quant_mode}")
+    if args.backend == "llamacpp":
+        if not (args.llamacpp_bin or args.llamacpp_url):
+            parser.error(
+                "llamacpp 后端需 --llamacpp_bin（CLI 模式）或 --llamacpp_url（server 模式）二选一"
+            )
+        if args.llamacpp_bin and not args.gguf_model:
+            parser.error("llamacpp CLI 模式必须提供 --gguf_model")
+        if args.quant_mode not in ("q8_0", "q4_k_m", "gguf"):
+            parser.error(
+                f"llamacpp 后端 quant_mode 请标注 GGUF 档（q8_0/q4_k_m/gguf），当前 {args.quant_mode}"
+            )
 
     logging.basicConfig(
         level=logging.INFO,
@@ -83,21 +141,42 @@ def main() -> int:
     split = args.nbest.stem  # e.g. "dev-clean" / "test-clean"
     records = load_nbest(args.nbest, args.max_samples)
     logger.info(
-        "GER 评测开始：%d 条 | model=%s | quant=%s | template=%s",
-        len(records), args.model, args.quant_mode, args.template,
+        "GER 评测开始：%d 条 | backend=%s | model=%s | quant=%s | template=%s",
+        len(records), args.backend, args.model, args.quant_mode, args.template,
     )
 
-    backend = HFBNBackend(
-        model_id=args.model,
-        quant_mode=args.quant_mode,
-        max_vram_gb=4.5 if args.quant_mode == "fp16" else None,
-    )
+    # ---------------- 后端构造（按 --backend 分支） ----------------
+    if args.backend == "mock":
+        backend = MockLLMBackend()
+    elif args.backend == "llamacpp":
+        backend = LlamaCppBackend(
+            model_path=args.gguf_model,
+            bin_path=args.llamacpp_bin,
+            server_url=args.llamacpp_url,
+            tokenizer_ref=args.model,  # 与渲染 prompt 同源的 HF tokenizer
+        )
+    else:  # hf_bnb
+        # fp16 权重 ~3.4GB + KV cache，预检阈值默认 4.4GB；量化档权重小，不预检。
+        # WSL2 下 Windows 侧常驻占用使空闲显存可能贴阈值边缘，可用 --max_vram_gb 放宽。
+        vram_budget = args.max_vram_gb
+        if vram_budget is None:
+            vram_budget = 4.4 if args.quant_mode == "fp16" else None
+        backend = HFBNBackend(
+            model_id=args.model,
+            quant_mode=args.quant_mode,
+            max_vram_gb=vram_budget,
+        )
 
     # 预渲染全部 prompt（模板渲染是 CPU 操作，与 GPU 生成解耦）
-    backend._load()  # 确保 tokenizer 可用
+    backend._load()  # 确保 tokenizer 可用（llamacpp: 校验二进制/server 就绪）
+    if args.backend == "hf_bnb":
+        render_tokenizer = backend.tokenizer
+    else:
+        # llamacpp/mock 无进程内 tokenizer，用离线 AutoTokenizer（模型已缓存）
+        render_tokenizer = AutoTokenizer.from_pretrained(args.model)
     prompts = [
         render_chat_prompt(
-            backend.tokenizer,
+            render_tokenizer,
             r["nbest"],
             SYSTEM_PROMPT,
             args.use_scores,
@@ -106,6 +185,13 @@ def main() -> int:
         for r in records
     ]
     max_new = [dynamic_max_new_tokens(r["nbest"]) for r in records]
+
+    # 进程外后端（llamacpp server）显存差分基线：进入生成前测一次
+    ext_gpu_base_mb = (
+        query_gpu_used_mb()
+        if args.backend == "llamacpp" and args.llamacpp_url
+        else None
+    )
 
     profiler = InferenceProfiler()
     hyps_raw: List[str] = []
@@ -117,6 +203,9 @@ def main() -> int:
         with profiler.track():
             for i, (rec, prompt, mnt) in enumerate(zip(records, prompts, max_new)):
                 result = backend.generate(prompt, max_new_tokens=mnt)
+                # 进程外后端自报精确 TTFT（llama.cpp server timings 口径）
+                if result.ttft_ms is not None:
+                    profiler.report_ttft(result.ttft_ms / 1000.0)
                 hyps_raw.append(extract_answer(result.text))
                 refs.append(rec["ref"])
                 total_audio += rec["duration"]
@@ -125,6 +214,15 @@ def main() -> int:
                     logger.info(
                         "进度 %d/%d | tokens=%d", i + 1, len(records),
                         total_completion_tokens,
+                    )
+            # 进程外后端显存差分（nvidia-smi 口径，常驻占用在差分中抵消）
+            if ext_gpu_base_mb is not None:
+                cur = query_gpu_used_mb()
+                if cur is not None:
+                    profiler.report_peak_vram(cur - ext_gpu_base_mb)
+                    logger.info(
+                        "llamacpp 进程级显存差分: %.0f MB (base=%.0f)",
+                        cur - ext_gpu_base_mb, ext_gpu_base_mb,
                     )
     finally:
         stats = profiler.finalize(
@@ -173,7 +271,10 @@ def main() -> int:
         append_summary_row(
             Path("outputs/metrics/summary.csv"),
             exp_name=exp_name, route="A", split=split,
-            model=args.model, backend="hf_bnb", quant_mode=args.quant_mode,
+            model=args.model,
+            backend={"hf_bnb": "hf_bnb", "llamacpp": "llamacpp",
+                      "mock": "mock"}[args.backend],
+            quant_mode=args.quant_mode,
             wer=wer["wer"], sub=wer["sub"], **{"del": wer["del"]},
             ins=wer["ins"],
             peak_vram_mb=stats["peak_vram_mb"],

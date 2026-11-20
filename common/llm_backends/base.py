@@ -60,3 +60,12 @@ class BaseLLMBackend(ABC):
     def warmup(self) -> None:
         """可选预热钩子（默认空操作）。"""
         return None
+
+    def _load(self) -> None:
+        """懒加载/就绪校验钩子（默认空操作）。
+
+        有加载需求的后端覆写：hf_bnb 加载权重与 tokenizer，
+        llamacpp 校验二进制/探测 server；调用方统一在首次生成前
+        调用一次，Mock 等无状态后端走默认空操作即可。
+        """
+        return None
