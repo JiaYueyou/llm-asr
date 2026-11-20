@@ -299,3 +299,142 @@ class TestMockLLMBackend:
     def test_backend_name(self):
         assert MockLLMBackend().backend_name == "mock"
         assert LlamaCppBackend(server_url="http://h:1").backend_name == "llamacpp"
+
+
+# ---------------------------------------------------------------------------
+# infer_ger checkpoint：逐条落盘 / --resume / 统计口径可加
+# ---------------------------------------------------------------------------
+class TestCheckpointResume:
+    def _run_cli(self, args: list, capsys=None):
+        """以子进程跑 infer_ger.py（隔离 sys.argv/全局态，冒烟即真实路径）。"""
+        import subprocess as sp
+
+        return sp.run(
+            [sys.executable, "route_a_ger/infer_ger.py", *args],
+            capture_output=True, text=True, timeout=300,
+        )
+
+    def test_load_checkpoint_corrupt_tail(self, tmp_path):
+        """断电截断的末行（无换行的半行 JSON）必须被丢弃，完整行保留。"""
+        from route_a_ger.infer_ger import load_checkpoint
+
+        f = tmp_path / "checkpoint.jsonl"
+        f.write_text(
+            '{"id": "a", "hyp_raw": "x", "ref": "r", "duration": 1.0, '
+            '"completion_tokens": 2, "gen_sec": 0.5, "ttft_sec": null, '
+            '"vram_mb": null}\n'
+            '{"id": "b", "hyp_raw": "trunca',  # 断电截断行
+            encoding="utf-8",
+        )
+        done = load_checkpoint(f)
+        assert set(done) == {"a"}
+
+    def test_load_checkpoint_missing(self, tmp_path):
+        from route_a_ger.infer_ger import load_checkpoint
+
+        assert load_checkpoint(tmp_path / "nope.jsonl") == {}
+
+    def test_append_checkpoint_fsync(self, tmp_path):
+        """append_checkpoint 必须逐条 fsync（防宿主断电丢 page cache）。"""
+        import io
+        import json as jsonlib
+
+        from route_a_ger.infer_ger import append_checkpoint
+
+        f = io.open(tmp_path / "ck.jsonl", "w", encoding="utf-8")
+        rec = {"id": "a", "hyp_raw": "x", "gen_sec": 0.1}
+        append_checkpoint(f, rec)
+        f.close()
+        line = (tmp_path / "ck.jsonl").read_text(encoding="utf-8")
+        assert jsonlib.loads(line)["id"] == "a"
+
+    def test_merge_stats_additive(self):
+        """两段统计合并 = Σ逐条：RTF/Tokens/s 不受段间间隔影响（口径核心）。"""
+        from route_a_ger.infer_ger import merge_stats
+
+        # 历史段：3 条，共 6s 生成 / 30s 音频 / 60 tokens / 峰值 3000MB
+        done = {
+            f"utt-{i}": {
+                "id": f"utt-{i}", "hyp_raw": "h", "ref": "r",
+                "duration": 10.0, "completion_tokens": 20,
+                "gen_sec": 2.0, "ttft_sec": 0.5, "vram_mb": 3000.0,
+            }
+            for i in range(3)
+        }
+        # 本段：1 条，2s / 10s / 20 tokens / 峰值 2800MB（低于历史）
+        cur_stats = {
+            "peak_vram_mb": 2800.0, "ttft": 0.9,
+            "_cur_gen_sec": 2.0, "_cur_audio_sec": 10.0, "_cur_new_tokens": 20,
+        }
+        m = merge_stats(done, cur_stats)
+        assert m["total_infer_sec"] == 8.0          # 6 + 2，Σgen_sec
+        assert m["total_audio_sec"] == 40.0         # 30 + 10
+        assert m["total_new_tokens"] == 80
+        assert m["rtf"] == 0.2                      # 8/40
+        assert m["tokens_per_sec"] == 10.0          # 80/8
+        assert m["peak_vram_mb"] == 3000.0          # 跨段 max
+        assert m["ttft"] == 0.5                     # 历史段首条 TTFT 优先
+
+    def test_merge_stats_empty_history_uses_gen_sec(self):
+        """无历史段（首跑被 Ctrl+C 后 checkpoint 为空）也统一 Σgen_sec 口径。"""
+        from route_a_ger.infer_ger import merge_stats
+
+        cur = {"peak_vram_mb": 100.0, "ttft": 0.2,
+               "_cur_gen_sec": 3.0, "_cur_audio_sec": 6.0, "_cur_new_tokens": 9}
+        m = merge_stats({}, cur)
+        assert m["total_infer_sec"] == 3.0
+        assert m["rtf"] == 0.5
+        assert m["tokens_per_sec"] == 3.0
+
+    def test_mock_two_segment_resume_e2e(self, tmp_path):
+        """端到端：段1 跑 20 条 -> 段2 --resume 跑全 50 条。
+
+        强断言：① WER 与 beam-1 基线完全一致（Mock 零纠错 + 合并顺序正确）；
+        ② checkpoint 恰 50 行；③ summary 行的 total_infer_sec ≈ Σgen_sec
+        （而非段2 墙钟——段2 含 tokenizer 加载等开销，若口径错误必然偏大）；
+        ④ predictions.jsonl 恰 50 条且顺序与源文件一致。
+        """
+        import json as jsonlib
+
+        out = tmp_path / "out"
+        common = [
+            "--nbest", "outputs/nbest/dev-clean.jsonl",
+            "--backend", "mock", "--template", "plain",
+            "--out_dir", str(out), "--write_summary",
+        ]
+        # 段1：20 条（无 --resume，新 checkpoint）
+        r1 = self._run_cli(common + ["--max_samples", "20", "--exp_name", "e2e"])
+        assert r1.returncode == 0, r1.stderr
+        ck1 = (out / "e2e" / "checkpoint.jsonl").read_text().strip().splitlines()
+        assert len(ck1) == 20
+
+        # 段2：全 50 条 --resume
+        r2 = self._run_cli(common + ["--exp_name", "e2e", "--resume"])
+        assert r2.returncode == 0, r2.stderr
+        assert "--resume：checkpoint 20/50 条已完成" in r2.stderr + r2.stdout
+
+        ck2 = (out / "e2e" / "checkpoint.jsonl").read_text().strip().splitlines()
+        assert len(ck2) == 50
+
+        # WER 与 beam-1 基线一致（断言在 stdout 的 GER 结果行）
+        line = [l for l in (r2.stdout + r2.stderr).splitlines() if "GER 结果" in l]
+        assert line, "缺少 GER 结果日志行"
+        assert "WER=0.0904" in line[0]
+        assert "基线=0.0904" in line[0]
+
+        # 统计口径：summary 的 total_infer_sec 应等于 Σgen_sec（毫秒级）
+        rows = (out / "metrics" / "summary.csv").read_text().strip().splitlines()
+        assert len(rows) == 3  # header + 段1 + 段2
+        header = rows[0].split(",")
+        row2 = dict(zip(header, rows[2].split(",")))
+        sum_gen = sum(jsonlib.loads(l)["gen_sec"] for l in ck2)
+        assert abs(float(row2["total_infer_sec"]) - sum_gen) < 0.05
+        # RTF = Σgen / Σaudio（音频时长固定，可精确核对）
+        import json as j
+        durs = [j.loads(l)["duration"] for l in open("outputs/nbest/dev-clean.jsonl")]
+        assert abs(float(row2["rtf"]) - sum_gen / sum(durs)) < 0.001
+
+        # predictions 顺序与完整性
+        preds = [j.loads(l) for l in open(out / "e2e" / "predictions.jsonl")]
+        src = [j.loads(l) for l in open("outputs/nbest/dev-clean.jsonl")]
+        assert [p["id"] for p in preds] == [s["id"] for s in src]

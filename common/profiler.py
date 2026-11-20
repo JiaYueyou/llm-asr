@@ -167,6 +167,16 @@ class InferenceProfiler:
         }
 
 
+def current_peak_vram_mb(device_id: int = 0) -> Optional[float]:
+    """track() 重置后至今的 torch allocator 峰值（MB）；无 CUDA 返回 None。
+
+    供逐条 checkpoint 采样：段内单调不降，跨段由调用方取 max 合并。
+    """
+    if _cuda_available():
+        return torch.cuda.max_memory_allocated(device_id) / (1024**2)
+    return None
+
+
 def query_gpu_free_mb(device_id: int = 0) -> Optional[float]:
     """通过 nvidia-smi 查询指定 GPU 的空闲显存（MB）；失败返回 None。
 

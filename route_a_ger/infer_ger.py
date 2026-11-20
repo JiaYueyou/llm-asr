@@ -20,6 +20,13 @@
     # 定制 llama.cpp（server 模式，模型常驻；TTFT/显存差分统计走此模式）
     python route_a_ger/infer_ger.py --nbest outputs/nbest/dev-clean.jsonl \
         --backend llamacpp --quant_mode q4_k_m --llamacpp_url http://127.0.0.1:8080
+
+断点续跑（宿舍断电/分批跑）：
+    首跑生成逐条 checkpoint（默认开启，outputs/<exp_name>/checkpoint.jsonl），
+    Ctrl+C / 断电后重跑同一命令加 --resume 即跳过已完成样本。
+    统计口径可加：总推理时长 = Σ逐条 gen_sec（模型加载/中断间隔不计入），
+    RTF / Tokens/s 跨段不因分段统计失真；peak VRAM 跨段取 max。
+    python route_a_ger/infer_ger.py ... --exp_name ger-1.7b-nf4-test-clean --resume
 """
 
 from __future__ import annotations
@@ -27,7 +34,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
+import time
 from pathlib import Path
 from typing import List
 
@@ -44,7 +53,11 @@ from common.metrics import (
     export_error_cases,
     export_predictions,
 )
-from common.profiler import InferenceProfiler, query_gpu_used_mb
+from common.profiler import (
+    InferenceProfiler,
+    current_peak_vram_mb,
+    query_gpu_used_mb,
+)
 from common.text_norm import normalize_for_wer
 from route_a_ger.prompts import (
     SYSTEM_PROMPT,
@@ -59,6 +72,84 @@ logger = logging.getLogger("infer_ger")
 def load_nbest(path: Path, max_samples: int | None = None) -> List[dict]:
     records = [json.loads(l) for l in open(path, encoding="utf-8")]
     return records[:max_samples] if max_samples else records
+
+
+# ---------------------------------------------------------------- checkpoint
+def checkpoint_path(base: Path) -> Path:
+    """逐条落盘的 checkpoint 文件路径（与产物同目录）。"""
+    return base / "checkpoint.jsonl"
+
+
+def load_checkpoint(path: Path) -> dict:
+    """读回 checkpoint：{id -> 逐条记录}。最后半行损坏（断电截断）自动丢弃。"""
+    done: dict = {}
+    if not path.exists():
+        return done
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                logger.warning("checkpoint 末行损坏，已丢弃（断电截断）: %s", path)
+                break
+            done[rec["id"]] = rec
+    return done
+
+
+def append_checkpoint(f, rec: dict) -> None:
+    """单条追加 + flush + fsync：宿主断电后已写入行不丢（page cache 落盘）。"""
+    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    f.flush()
+    os.fsync(f.fileno())
+
+
+def merge_stats(done: dict, stats: dict) -> dict:
+    """把 checkpoint 历史段与本段的统计合并为全量口径（函数见模块 docstring）。
+
+    - total_infer_sec 统一为 Σ逐条 gen_sec：历史段（checkpoint）+ 本段，
+      模型加载、段间中断间隔、checkpoint fsync 开销均不计入——单段与
+      续跑口径一致，RTF / Tokens/s 由其派生不失真；
+    - total_audio_sec / total_new_tokens：逐条累加，跨段精确可加；
+    - peak_vram_mb：跨段取 max（任一段为 None 时取另一段）；
+    - ttft：取历史段首条记录（无则保留本段值）。
+    """
+    hist_gen_sec = sum(r["gen_sec"] for r in done.values())
+    hist_audio = sum(r["duration"] for r in done.values())
+    hist_tokens = sum(r["completion_tokens"] for r in done.values())
+    total_gen = hist_gen_sec + stats.get("_cur_gen_sec", 0.0)
+    total_audio = hist_audio + stats.get("_cur_audio_sec", 0.0)
+    total_tokens = hist_tokens + stats.get("_cur_new_tokens", 0)
+    merged = dict(stats)
+    merged["total_infer_sec"] = round(total_gen, 3)
+    merged["total_audio_sec"] = round(total_audio, 3)
+    merged["total_new_tokens"] = total_tokens
+    merged["rtf"] = round(total_gen / max(total_audio, 1e-6), 4)
+    merged["tokens_per_sec"] = (
+        round(total_tokens / total_gen, 2) if total_gen > 0 else 0.0
+    )
+    hist_vram = done_first_vram(done)
+    merged["peak_vram_mb"] = max(
+        filter(None, [hist_vram, stats.get("peak_vram_mb")]),
+        default=None,
+    )
+    hist_ttft = _hist_first_ttft(done)
+    if hist_ttft is not None:
+        merged["ttft"] = hist_ttft
+    return merged
+
+
+def done_first_vram(done: dict) -> float | None:
+    """历史段逐条记录中的最大显存峰值（checkpoint 逐条存了 vram_mb）。"""
+    vals = [r["vram_mb"] for r in done.values() if r.get("vram_mb") is not None]
+    return max(vals) if vals else None
+
+
+def _hist_first_ttft(done: dict) -> float | None:
+    """历史段首个样本的 TTFT 秒（有则沿用，None 不覆盖本段值）。"""
+    for r in done.values():
+        if r.get("ttft_sec") is not None:
+            return r["ttft_sec"]
+    return None
 
 
 def main() -> int:
@@ -110,6 +201,14 @@ def main() -> int:
     parser.add_argument(
         "--max_vram_gb", type=float, default=None,
         help="加载前空闲显存预检阈值（GB）；默认 fp16=4.4、量化档不预检",
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="断点续跑：从 outputs/<exp_name>/checkpoint.jsonl 跳过已完成样本",
+    )
+    parser.add_argument(
+        "--no_checkpoint", action="store_true",
+        help="禁用逐条 checkpoint（默认开启）",
     )
     args = parser.parse_args()
 
@@ -198,18 +297,65 @@ def main() -> int:
     refs: List[str] = []
     total_audio = 0.0
     total_completion_tokens = 0
+    cur_gen_sec = 0.0  # 本段逐条生成耗时累加（口径可加，不含模型加载）
+
+    # ---------------- 断点续跑：checkpoint 载入 ----------------
+    exp_name = args.exp_name or (
+        f"ger-{args.model.split('/')[-1]}-{args.quant_mode}-{split}"
+    )
+    base = args.out_dir / exp_name
+    base.mkdir(parents=True, exist_ok=True)
+    ckpt_file = checkpoint_path(base)
+    if args.resume:
+        record_ids = {r["id"] for r in records}
+        done = {
+            rid: rec
+            for rid, rec in load_checkpoint(ckpt_file).items()
+            if rid in record_ids  # 防 --max_samples 变化等导致的脏统计
+        }
+        logger.info(
+            "--resume：checkpoint %d/%d 条已完成，跳过", len(done), len(records)
+        )
+    else:
+        done = {}
+        # 首跑截断旧 checkpoint（exp_name 复用时防串档）
+        if ckpt_file.exists() and not args.no_checkpoint:
+            ckpt_file.unlink()
+            logger.warning("checkpoint 已存在，首跑将覆盖: %s", ckpt_file)
+
+    ckpt_fp = None
+    if not args.no_checkpoint:
+        ckpt_fp = open(ckpt_file, "a", encoding="utf-8")
 
     try:
         with profiler.track():
             for i, (rec, prompt, mnt) in enumerate(zip(records, prompts, max_new)):
+                if rec["id"] in done:
+                    continue  # 已完成样本：跳过生成，统计走 checkpoint 合并
+                t0 = time.perf_counter()
                 result = backend.generate(prompt, max_new_tokens=mnt)
+                gen_sec = time.perf_counter() - t0
                 # 进程外后端自报精确 TTFT（llama.cpp server timings 口径）
                 if result.ttft_ms is not None:
                     profiler.report_ttft(result.ttft_ms / 1000.0)
-                hyps_raw.append(extract_answer(result.text))
+                hyp = extract_answer(result.text)
+                hyps_raw.append(hyp)
                 refs.append(rec["ref"])
                 total_audio += rec["duration"]
                 total_completion_tokens += result.completion_tokens
+                cur_gen_sec += gen_sec
+                # 逐条 checkpoint：flush+fsync，断电后以最后完整行为准
+                if ckpt_fp is not None:
+                    append_checkpoint(ckpt_fp, {
+                        "id": rec["id"],
+                        "hyp_raw": hyp,
+                        "ref": rec["ref"],
+                        "duration": rec["duration"],
+                        "completion_tokens": result.completion_tokens,
+                        "gen_sec": round(gen_sec, 6),
+                        "ttft_sec": None,  # HF 后端非流式无逐条 TTFT；server 模式经 profiler 注入
+                        "vram_mb": current_peak_vram_mb(),
+                    })
                 if (i + 1) % 10 == 0:
                     logger.info(
                         "进度 %d/%d | tokens=%d", i + 1, len(records),
@@ -225,13 +371,35 @@ def main() -> int:
                         cur - ext_gpu_base_mb, ext_gpu_base_mb,
                     )
     finally:
+        if ckpt_fp is not None:
+            ckpt_fp.close()
         stats = profiler.finalize(
             total_audio_sec=max(total_audio, 1e-6),
             total_new_tokens=total_completion_tokens,
         )
+        # 分段统计口径合并：Σgen_sec 替代墙钟（模型加载/中断间隔不计入），
+        # RTF/Tokens/s 可加不失真；peak VRAM 跨段取 max；TTFT 取历史首条
+        stats["_cur_gen_sec"] = cur_gen_sec
+        stats["_cur_audio_sec"] = total_audio
+        stats["_cur_new_tokens"] = total_completion_tokens
+        stats = merge_stats(done, stats)
         backend.unload()
 
-    # 规范化 + WER（text_norm 内含思考标签/前缀防御性剥离）
+    # 规范化 + WER：续跑时全量 = checkpoint 历史段 + 本段（保持文件顺序；
+    # 本段 hyps_raw 只含新生成样本，按游标对位，skipped 从 checkpoint 取回）
+    if done:
+        merged_hyps: List[str] = []
+        merged_refs: List[str] = []
+        cur_idx = 0
+        for r in records:
+            if r["id"] in done:
+                merged_hyps.append(done[r["id"]]["hyp_raw"])
+                merged_refs.append(done[r["id"]]["ref"])
+            else:
+                merged_hyps.append(hyps_raw[cur_idx])
+                merged_refs.append(refs[cur_idx])
+                cur_idx += 1
+        hyps_raw, refs = merged_hyps, merged_refs
     hyps_norm = [normalize_for_wer(h) for h in hyps_raw]
     refs_norm = [normalize_for_wer(r) for r in refs]
     wer = compute_wer(refs_norm, hyps_norm, normalize=False)
@@ -244,12 +412,7 @@ def main() -> int:
         baseline["wer"], (baseline["wer"] - wer["wer"]) * 100,
     )
 
-    # 产物归档
-    exp_name = args.exp_name or (
-        f"ger-{args.model.split('/')[-1]}-{args.quant_mode}-{split}"
-    )
-    base = args.out_dir / exp_name
-    base.mkdir(parents=True, exist_ok=True)
+    # 产物归档（exp_name/base 已在 checkpoint 段确定）
     export_predictions(
         base / "predictions.jsonl",
         (
@@ -269,7 +432,7 @@ def main() -> int:
 
     if args.write_summary:
         append_summary_row(
-            Path("outputs/metrics/summary.csv"),
+            args.out_dir / "metrics" / "summary.csv",
             exp_name=exp_name, route="A", split=split,
             model=args.model,
             backend={"hf_bnb": "hf_bnb", "llamacpp": "llamacpp",
