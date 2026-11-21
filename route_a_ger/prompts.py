@@ -21,12 +21,62 @@ SYSTEM_PROMPT = (
 )
 
 
+def _truncate_repetition(
+    words: List[str],
+    short_unit: int = 4,
+    long_unit: int = 6,
+    short_threshold: float = 0.95,
+    long_threshold: float = 0.85,
+) -> List[str]:
+    """复读截断：检测「首段 ≈ 其后副本」的整句/分句复读并截到首段边界。
+
+    低比特量化（尤其 NF4）偶发 EOS 前循环复读，且常是**近似重复**而非逐字
+    精确重复（如 ``emerald → emerold → emeralds``、``seized → seizes``），
+    旧的精确 20-gram 匹配抓不到；本函数改用词级模糊匹配。
+
+    算法：令输出词序列为 words，枚举首段长度 s（``short_unit ≤ s ≤ n//2``），
+    将 ``words[:s]`` 与紧随其后的等长窗口 ``words[s:2s]`` 做
+    ``SequenceMatcher`` 词级相似度；一旦命中即认定复读，截断到 ``words[:s]``
+    （保留首遍完整内容）。取**最小**命中 s = 首遍真实边界。
+
+    两级阈值（严格防误截文学文本正常排比/短语重复）：
+      - **短单元**（``short_unit ≤ s < long_unit``，即 4–5 词）：要求近乎
+        逐字精确 ``short_threshold=0.95``——短叠词/短语复读（``squeak``×N、
+        ``anders face grew red``×N）能捕获，而正常短排比偶尔重复 4–5 词时
+        相似度远达不到 0.95，不会误截；
+      - **长单元**（``s ≥ long_unit``，即 ≥6 词）：``long_threshold=0.85``——
+        覆盖 NF4 微变长句复读；真实朗读转写中 6+ 词近逐字复现基本不可能，
+        正常文本不会巧合达到。实测 ``we shall fight on the beaches ...`` 等
+        经典排比最大相似度仅 0.83，安全。
+      - 仅当 ``n ≥ 2*short_unit`` 才检测，短输出直接放过。
+    """
+    from difflib import SequenceMatcher
+
+    n = len(words)
+    if n < 2 * short_unit:
+        return words
+    # 取相似度最高的候选边界（并列取最小 s = 首遍最短单元）。
+    # 不能用「首个达阈值即返回」——错位一个词的首段（如 12 词）相似度
+    # 0.92 会先于正确的 13 词边界（1.0）命中，导致丢掉边界处一词；取最高
+    # 相似度可精确落在首遍真实边界。
+    best_s: int | None = None
+    best_ratio = 0.0
+    for s in range(short_unit, n // 2 + 1):
+        threshold = long_threshold if s >= long_unit else short_threshold
+        ratio = SequenceMatcher(None, words[:s], words[s:s + s]).ratio()
+        if ratio >= threshold and ratio > best_ratio + 1e-9:
+            best_ratio = ratio
+            best_s = s
+    return words[:best_s] if best_s is not None else words
+
+
 def extract_answer(raw_text: str) -> str:
     """从 LLM 原始输出中提取最终答案（防御性解析）。
 
     三层防御：
       1. 复读截断：低比特量化偶发 EOS 前循环复读（红线 7.2 的兜底），
-         以首个 20+ 词 n-gram 的二次出现为循环点，截掉其后内容；
+         支持精确与近似（微变）重复，按首个重复单元截断（短单元 4–5 词需
+         0.95、长单元 ≥6 词需 0.85，见 ``_truncate_repetition``）；
       2. 多行输出 -> 取最后一个非空行（答案通常在最后）；
       3. 该行若以 "N." / "N)" 开头则剥离编号。
     """
@@ -36,21 +86,12 @@ def extract_answer(raw_text: str) -> str:
     if not text:
         return ""
 
-    # 1) 复读循环截断：滑窗找重复 20 词片段。
-    #    循环单位可能是任意长度的整句；首个重复 n-gram 的第二次出现位置 i2
-    #    即首遍完整内容的结束边界，保留 words[:i2]（而非 seen[key]+N，
-    #    否则首遍长句会被截短）。
-    words = text.split()
-    if len(words) > 40:
-        N = 20
-        seen = {}
-        for i in range(len(words) - N):
-            key = " ".join(words[i : i + N])
-            if key in seen:
-                words = words[:i]  # i = 第二次出现起点 = 首遍完整边界
-                text = " ".join(words)
-                break
-            seen[key] = i
+    # 1) 复读循环截断：词级近似重复检测（含短句复读，无 40 词硬门槛）。
+    #    仅在实际截断时重建文本——否则保留原换行，供第 2 步「多行取末行」用。
+    orig_words = text.split()
+    trunc_words = _truncate_repetition(orig_words)
+    if trunc_words != orig_words:
+        text = " ".join(trunc_words)
 
     # 2) 多行取末行
     lines = [l.strip() for l in text.splitlines() if l.strip()]

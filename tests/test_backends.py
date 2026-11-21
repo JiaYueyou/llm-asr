@@ -20,8 +20,10 @@ from common.llm_backends.llamacpp_custom import LlamaCppBackend  # noqa: E402
 from common.llm_backends.mock import MockLLMBackend  # noqa: E402
 from route_a_ger.prompts import (  # noqa: E402
     SYSTEM_PROMPT,
+    _truncate_repetition,
     build_ger_prompt,
     dynamic_max_new_tokens,
+    extract_answer,
 )
 
 
@@ -119,6 +121,77 @@ class TestDynamicMaxNewTokens:
 
     def test_empty_guard(self):
         assert dynamic_max_new_tokens([]) == 24
+
+
+# ---------------------------------------------------------------------------
+# extract_answer 复读截断（近似重复 / 短句复读 / 正常排比不误截）
+# ---------------------------------------------------------------------------
+class TestExtractAnswerRepetition:
+    def test_nf4_near_duplicate_emerald(self):
+        """NF4 微变复读：emerald→emerold / seized→seizes 近似重复应截到首遍。"""
+        unit = ("at the emerald city where our princess osma lives green is "
+                "the popular color")
+        text = (unit + " at the emerold city where our princess osma lives "
+                "green is the popular color")
+        assert extract_answer(text) == unit
+
+    def test_nf4_near_duplicate_seized(self):
+        unit = "then he tossed it down and seized the next"
+        text = (unit + " then he tossed it down and seizes the next "
+                "then he tossed it down and seizes the next")
+        assert extract_answer(text) == unit
+
+    def test_exact_long_duplicate(self):
+        """精确长句复读（>40 词旧守卫本已覆盖，新逻辑须保持一致）。"""
+        unit = "the bear shook his shaggy sides and then a well known voice replied"
+        text = unit + " " + unit + " " + unit
+        assert extract_answer(text) == unit
+
+    def test_short_sentence_duplicate(self):
+        """短句复读（8 词，单元 4 词）——旧 len>40 硬门槛会放过，新版须捕获。"""
+        text = "you are positive then you are positive then"
+        assert extract_answer(text) == "you are positive then"
+
+    def test_short_token_repeat(self):
+        """短叠词复读（squeak×8）应截断到单个单元。"""
+        text = "squeak " * 8
+        out = extract_answer(text)
+        assert out == "squeak squeak squeak squeak"  # 短单元 s=4 命中，保留前 4
+
+    def test_no_false_truncation_parallelism(self):
+        """经典文学排比（正常文本）不得被误截。"""
+        cases = [
+            "we shall fight on the beaches we shall fight on the landing grounds "
+            "we shall fight in the fields",
+            "it was the best of times it was the worst of times it was the age of wisdom",
+            "he said that he would come and he said that he would stay",
+            "she walked through the garden and she walked through the orchard",
+            "he opened the door and he opened the window and he opened the gate",
+        ]
+        for s in cases:
+            assert extract_answer(s) == s, f"正常句被误截: {s!r}"
+
+    def test_no_false_truncation_short_repeats(self):
+        """合法短叠词/短语（< 4 词单元）不触发截断。"""
+        for s in ["no no no that is not what i meant at all",
+                  "a a b b c c is a pattern not a repetition",
+                  "very very good indeed and very very kind"]:
+            assert extract_answer(s) == s
+
+    def test_short_output_untouched(self):
+        """短输出（< 2*short_unit=8 词）直接放过。"""
+        assert extract_answer("he said hello there") == "he said hello there"
+
+    def test_truncate_repetition_direct(self):
+        """_truncate_repetition 直接接口 + 边界（s 取首遍真实边界）。"""
+        words = ("the cat sat on the mat " * 3).split()
+        assert _truncate_repetition(words) == "the cat sat on the mat".split()
+
+    def test_empty_and_multiline_not_broken(self):
+        """原有行为不被破坏：空串返回空、多行取末行、行首编号剥离。"""
+        assert extract_answer("") == ""
+        assert extract_answer("first line\nsecond line") == "second line"
+        assert extract_answer("1. the answer here") == "the answer here"
 
 
 # ---------------------------------------------------------------------------
