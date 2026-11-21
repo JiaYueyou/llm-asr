@@ -16,6 +16,10 @@ score 为 pyctcdecode 的 lm_score + logltoken（CTC 对数似然），
     # 全量
     python route_a_ger/extract_nbest.py --split test-clean
     python route_a_ger/extract_nbest.py --split test-other
+
+    # 云端离线：使用本地下载的模型目录
+    python route_a_ger/extract_nbest.py --split train-clean-100 \
+        --model /mnt/workspace/models/wav2vec2-base-100h
 """
 
 from __future__ import annotations
@@ -45,10 +49,13 @@ N_BEST = 5
 BEAM_WIDTH = 32  # pyctcdecode 束宽；Top-5 需要 >5 的束宽才稳定
 
 
-def load_model(device: str) -> tuple:
-    """加载 wav2vec2 CTC 模型（FP16 可选）与处理器。"""
-    processor = Wav2Vec2Processor.from_pretrained(MODEL_ID)
-    model = Wav2Vec2ForCTC.from_pretrained(MODEL_ID).to(device)
+def load_model(device: str, model_id: str = MODEL_ID) -> tuple:
+    """加载 wav2vec2 CTC 模型（FP16 可选）与处理器。
+
+    ``model_id`` 支持 HF repo id 或本地目录（云端离线场景传下载好的目录）。
+    """
+    processor = Wav2Vec2Processor.from_pretrained(model_id)
+    model = Wav2Vec2ForCTC.from_pretrained(model_id).to(device)
     model.eval()
     if device.startswith("cuda"):
         model = model.half()  # 95M 参数，FP16 足够且省显存
@@ -152,6 +159,11 @@ def main() -> int:
         help="LibriSpeech split 名（如 test-clean / dev-clean）",
     )
     parser.add_argument(
+        "--model",
+        default=MODEL_ID,
+        help=f"wav2vec2 模型：HF repo id 或本地目录（默认 {MODEL_ID}）",
+    )
+    parser.add_argument(
         "--manifest",
         type=Path,
         default=None,
@@ -205,7 +217,7 @@ def main() -> int:
         records = records[: args.max_samples]
     logger.info("split=%s 读入 %d 条样本", args.split, len(records))
 
-    processor, model = load_model(args.device)
+    processor, model = load_model(args.device, args.model)
     decoder = build_decoder(processor)
 
     output_path = args.output_dir / f"{args.split}.jsonl"
@@ -268,7 +280,7 @@ def main() -> int:
             exp_name=f"acoustic-greedy-{args.split}",
             route="A",
             split=args.split,
-            model=MODEL_ID,
+            model=args.model,
             backend="wav2vec2",
             quant_mode="fp16",
             wer=wer["wer"],
