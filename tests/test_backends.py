@@ -830,3 +830,112 @@ class TestCheckpointResume:
         preds = [j.loads(l) for l in open(out / "e2e" / "predictions.jsonl")]
         src = [j.loads(l) for l in open("outputs/nbest/dev-clean.jsonl")]
         assert [p["id"] for p in preds] == [s["id"] for s in src]
+
+
+# ---------------------------------------------------------------------------
+# LoRA adapter 挂载参数（Task 1.6）
+# ---------------------------------------------------------------------------
+class TestLoraPath:
+    def test_backend_stores_lora_path(self):
+        from common.llm_backends.hf_bnb import HFBNBackend
+
+        b = HFBNBackend(model_id="Qwen/Qwen3-1.7B", quant_mode="nf4",
+                        lora_path="/tmp/adapter")
+        assert b.lora_path == "/tmp/adapter"
+        assert b.model is None and b.tokenizer is None  # 构造不加载权重
+
+    def test_backend_default_no_lora(self):
+        from common.llm_backends.hf_bnb import HFBNBackend
+
+        assert HFBNBackend(model_id="x").lora_path is None
+
+    @pytest.mark.parametrize("backend", ["mock", "llamacpp"])
+    def test_infer_ger_rejects_lora_on_non_hf_backend(self, tmp_path, backend):
+        """--lora_path 与非 hf_bnb 后端组合必须在参数校验阶段拦截（不加载模型）。"""
+        import os
+        import subprocess as sp
+
+        nbest = tmp_path / "dummy.jsonl"
+        nbest.write_text("", encoding="utf-8")
+        extra = (
+            ["--llamacpp_url", "http://127.0.0.1:1"]
+            if backend == "llamacpp" else []
+        )
+        r = sp.run(
+            [
+                sys.executable, "route_a_ger/infer_ger.py",
+                "--nbest", str(nbest), "--backend", backend,
+                "--lora_path", "/tmp/adapter", *extra,
+            ],
+            capture_output=True, text=True, timeout=120,
+            env={**os.environ, "HF_HUB_OFFLINE": "1"},
+        )
+        assert r.returncode == 2
+        assert "--lora_path" in r.stderr
+        assert "hf_bnb" in r.stderr
+
+
+# ---------------------------------------------------------------------------
+# LoRA：模板硬保护 + 结果隔离（Task 1.6 收口）
+# ---------------------------------------------------------------------------
+class TestLoraIsolation:
+    def test_quant_mode_label(self):
+        from route_a_ger.infer_ger import quant_mode_label
+
+        assert quant_mode_label("nf4", None) == "nf4"
+        assert quant_mode_label("nf4", "/tmp/adapter") == "nf4_qlora"
+
+    def test_default_exp_name_isolated_from_zero_shot(self):
+        from route_a_ger.infer_ger import default_exp_name
+
+        zero = default_exp_name("Qwen/Qwen3-1.7B", "nf4", "test-clean", None)
+        lora = default_exp_name(
+            "Qwen/Qwen3-1.7B", "nf4", "test-clean", "/tmp/adapter"
+        )
+        assert zero == "ger-Qwen3-1.7B-nf4-test-clean"
+        assert lora == "ger-Qwen3-1.7B-nf4_qlora-test-clean"
+        assert zero != lora  # 目录/产物不互相覆盖
+
+    def test_resolve_and_check_template(self, tmp_path):
+        from route_a_ger.infer_ger import (
+            check_lora_template,
+            resolve_lora_template,
+        )
+
+        assert resolve_lora_template(tmp_path) is None  # 无 summary
+        (tmp_path / "qlora_summary.json").write_text(
+            json.dumps({"train": {"template": "plain"}}), encoding="utf-8"
+        )
+        assert resolve_lora_template(tmp_path) == "plain"
+        assert check_lora_template(tmp_path, "plain") is None
+        assert check_lora_template(tmp_path, "numbered") == "plain"
+
+    def test_malformed_summary_is_not_fatal(self, tmp_path):
+        from route_a_ger.infer_ger import resolve_lora_template
+
+        (tmp_path / "qlora_summary.json").write_text("{bad", encoding="utf-8")
+        assert resolve_lora_template(tmp_path) is None
+
+    def test_cli_rejects_template_mismatch(self, tmp_path):
+        """--template 与训练模板冲突必须在加载模型前 parser.error（退出码 2）。"""
+        import os
+        import subprocess as sp
+
+        adapter = tmp_path / "adapter"
+        adapter.mkdir()
+        (adapter / "qlora_summary.json").write_text(
+            json.dumps({"train": {"template": "plain"}}), encoding="utf-8"
+        )
+        r = sp.run(
+            [
+                sys.executable, "route_a_ger/infer_ger.py",
+                "--nbest", str(tmp_path / "dummy.jsonl"),
+                "--backend", "hf_bnb", "--quant_mode", "nf4",
+                "--lora_path", str(adapter), "--template", "numbered",
+            ],
+            capture_output=True, text=True, timeout=120,
+            env={**os.environ, "HF_HUB_OFFLINE": "1"},
+        )
+        assert r.returncode == 2
+        assert "训练模板 plain" in r.stderr
+        assert "--template plain" in r.stderr

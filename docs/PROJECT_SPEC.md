@@ -60,7 +60,7 @@ llm-asr-quant/
 │   ├── extract_nbest.py         # wav2vec2-base-100h + pyctcdecode 导出并缓存 Top-5
 │   ├── prompts.py               # 严格受控的 GER Prompt 模板（禁用思维链）
 │   ├── infer_ger.py             # 读取缓存 JSONL，切换不同 Backend 批量纠错并评测
-│   └── finetune_qlora.py        # QLoRA 微调脚本（适配 6GB 本地调试与 24GB 正式训练）
+│   └── train_qlora.py           # QLoRA 微调脚本（适配 6GB 本地调试与 24GB 正式训练）
 ├── route_b_e2e/                 # 【阶段二：端到端 Speech-LLM】
 │   ├── projector.py             # 下采样 + 2层 MLP 跨模态投影层定义
 │   ├── model_speech_llm.py      # Whisper-small Encoder + Projector + Qwen3 联合前向封装
@@ -106,7 +106,7 @@ llm-asr-quant/
 - [ ] **Task 1.3**：实现 `route_a_ger/extract_nbest.py`，在本地 3060 上跑完 `test-clean` 与 `test-other` 并缓存 Top-5 JSONL，产出纯声学基线 WER。
 - [ ] **Task 1.4**：实现 `common/llm_backends/hf_bnb.py` 与 `route_a_ger/infer_ger.py`，在本地跑通 `Qwen3-1.7B` 的 FP16 / INT8 / NF4 零样本评测。
 - [ ] **Task 1.5**：实现 `common/llm_backends/llamacpp_custom.py`，对接本地自研/定制 `llama.cpp`，跑通 GGUF 模型推理与真实端侧 RTF/显存统计。
-- [ ] **Task 1.6**：实现 `route_a_ger/finetune_qlora.py`，用 `train-clean-100` 子集抽取 N-best，在本地 3060 调试 QLoRA 纠错微调并评估效果提升。
+- [ ] **Task 1.6**：实现 `route_a_ger/train_qlora.py`，用 `train-clean-100` 子集抽取 N-best，在本地 3060 调试 QLoRA 纠错微调并评估效果提升。
 - [ ] **Task 1.7**：编写 `scripts/run_route_a_cloud.sh`，上云端 4090 一键跑完 `4B` / `8B` 全组合并回收实验报告图表数据。
 
 ### Stage 2: 路线 B 端到端扩展（Stage 1 完成后启动）

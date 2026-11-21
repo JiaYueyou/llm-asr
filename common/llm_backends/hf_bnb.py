@@ -4,6 +4,9 @@
     fp16: ~3.4GB 权重 + KV cache（动态 max_new_tokens 控制在 <100MB）
     int8: ~1.9GB
     nf4 : ~1.2GB（double quant）
+
+可选 ``lora_path``：加载底座后通过 peft 挂载 QLoRA adapter（Task 1.6 产物），
+底座保持原量化精度，adapter 以低秩增量参与前向。
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ class HFBNBackend(BaseLLMBackend):
         device_map: str = "cuda:0",
         max_vram_gb: Optional[float] = None,
         repetition_penalty: float = 1.10,
+        lora_path: Optional[str] = None,
     ):
         if quant_mode not in ("fp16", "int8", "nf4"):
             raise ValueError(f"未知 quant_mode: {quant_mode}（可选 fp16/int8/nf4）")
@@ -41,6 +45,7 @@ class HFBNBackend(BaseLLMBackend):
         self.device_map = device_map
         self.max_vram_gb = max_vram_gb
         self.repetition_penalty = repetition_penalty
+        self.lora_path = lora_path
         self.model = None
         self.tokenizer = None
 
@@ -82,6 +87,14 @@ class HFBNBackend(BaseLLMBackend):
                     bnb_4bit_compute_dtype=torch.float16,
                 ),
                 **common,
+            )
+        # 可选挂载 LoRA adapter（QLoRA 微调产物）：底座保持量化，仅附加低秩权重
+        if self.lora_path:
+            from peft import PeftModel
+
+            logger.info("挂载 LoRA adapter: %s", self.lora_path)
+            model = PeftModel.from_pretrained(
+                model, self.lora_path, is_trainable=False
             )
         model.eval()
         self.model = model

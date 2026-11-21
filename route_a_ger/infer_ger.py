@@ -21,6 +21,11 @@
     python route_a_ger/infer_ger.py --nbest outputs/nbest/dev-clean.jsonl \
         --backend llamacpp --quant_mode q4_k_m --llamacpp_url http://127.0.0.1:8080
 
+    # 挂载 QLoRA adapter（Task 1.6 产物；仅 hf_bnb 后端）。
+    # 注意 --template 必须与训练时一致（train_qlora.py 默认 plain）
+    python route_a_ger/infer_ger.py --nbest outputs/nbest/dev-clean.jsonl \
+        --quant_mode nf4 --lora_path /tmp/qlora_smoke --template plain --max_samples 5
+
 断点续跑（宿舍断电/分批跑）：
     首跑生成逐条 checkpoint（默认开启，outputs/<exp_name>/checkpoint.jsonl），
     Ctrl+C / 断电后重跑同一命令加 --resume 即跳过已完成样本。
@@ -74,6 +79,49 @@ logger = logging.getLogger("infer_ger")
 def load_nbest(path: Path, max_samples: int | None = None) -> List[dict]:
     records = [json.loads(l) for l in open(path, encoding="utf-8")]
     return records[:max_samples] if max_samples else records
+
+
+# ---------------------------------------------------------------------------
+# LoRA：训练/推理模板一致性 + 结果标签隔离
+# ---------------------------------------------------------------------------
+def resolve_lora_template(lora_path: str | Path) -> str | None:
+    """读取 adapter 目录下 qlora_summary.json 的训练 template。
+
+    文件不存在、JSON 损坏或无 ``train.template`` 字段（旧 adapter）返回 None。
+    """
+    summary = Path(lora_path) / "qlora_summary.json"
+    if not summary.exists():
+        return None
+    try:
+        data = json.loads(summary.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        logger.warning("qlora_summary.json 读取失败，跳过模板校验: %s", summary)
+        return None
+    return (data.get("train") or {}).get("template")
+
+
+def check_lora_template(lora_path: str | Path, template: str) -> str | None:
+    """返回与当前 --template 冲突的训练模板；一致/无元数据返回 None。"""
+    train_template = resolve_lora_template(lora_path)
+    if train_template and train_template != template:
+        return train_template
+    return None
+
+
+def quant_mode_label(quant_mode: str, lora_path: str | None) -> str:
+    """评估标签：LoRA 推理与零样本严格隔离（如 nf4 -> nf4_qlora）。
+
+    该标签同时进入默认 exp_name 与 summary.csv 的 quant_mode 字段，
+    保证 LoRA 结果不会覆盖/混淆已有零样本档。
+    """
+    return f"{quant_mode}_qlora" if lora_path else quant_mode
+
+
+def default_exp_name(
+    model: str, quant_mode: str, split: str, lora_path: str | None
+) -> str:
+    """默认实验名；LoRA 场景带 ``_qlora`` 后缀，避免覆盖零样本目录。"""
+    return f"ger-{model.split('/')[-1]}-{quant_mode_label(quant_mode, lora_path)}-{split}"
 
 
 def _query_llamaserver_vram() -> float | None:
@@ -194,6 +242,10 @@ def main() -> int:
         help="推理后端：hf_bnb（默认）| llamacpp（定制版）| mock（管线冒烟）",
     )
     parser.add_argument(
+        "--lora_path", default=None,
+        help="LoRA adapter 目录（仅 hf_bnb 后端；QLoRA 微调产物）",
+    )
+    parser.add_argument(
         "--llamacpp_bin", type=Path, default=None,
         help="定制 llama-cli 可执行路径（llamacpp CLI 模式，红线 7.5：CLI 注入不硬编码）",
     )
@@ -247,6 +299,19 @@ def main() -> int:
         ]
     if args.backend == "hf_bnb" and args.quant_mode not in ("fp16", "int8", "nf4"):
         parser.error(f"hf_bnb 后端不支持 quant_mode={args.quant_mode}")
+    if args.lora_path and args.backend != "hf_bnb":
+        parser.error(
+            f"--lora_path 仅支持 hf_bnb 后端（当前 backend={args.backend}）；"
+            "llamacpp 需先将 adapter 合并导出为 GGUF"
+        )
+    if args.lora_path:
+        # 硬保护：训练/推理模板必须一致，否则静默分布错配会污染 WER
+        train_template = check_lora_template(args.lora_path, args.template)
+        if train_template:
+            parser.error(
+                f"--template={args.template} 与训练模板 {train_template} 不一致；"
+                f"请改用 --template {train_template}"
+            )
     if args.backend == "llamacpp":
         if not (args.llamacpp_bin or args.llamacpp_url):
             parser.error(
@@ -268,8 +333,9 @@ def main() -> int:
     split = args.nbest.stem  # e.g. "dev-clean" / "test-clean"
     records = load_nbest(args.nbest, args.max_samples)
     logger.info(
-        "GER 评测开始：%d 条 | backend=%s | model=%s | quant=%s | template=%s",
+        "GER 评测开始：%d 条 | backend=%s | model=%s | quant=%s | template=%s | lora=%s",
         len(records), args.backend, args.model, args.quant_mode, args.template,
+        args.lora_path or "none",
     )
 
     # ---------------- 后端构造（按 --backend 分支） ----------------
@@ -292,6 +358,7 @@ def main() -> int:
             model_id=args.model,
             quant_mode=args.quant_mode,
             max_vram_gb=vram_budget,
+            lora_path=args.lora_path,
         )
 
     # 预渲染全部 prompt（模板渲染是 CPU 操作，与 GPU 生成解耦）
@@ -344,8 +411,10 @@ def main() -> int:
     cur_gen_sec = 0.0  # 本段逐条生成耗时累加（口径可加，不含模型加载）
 
     # ---------------- 断点续跑：checkpoint 载入 ----------------
-    exp_name = args.exp_name or (
-        f"ger-{args.model.split('/')[-1]}-{args.quant_mode}-{split}"
+    # LoRA 结果隔离：默认实验名与 summary.quant_mode 使用 nf4_qlora 标签
+    quant_label = quant_mode_label(args.quant_mode, args.lora_path)
+    exp_name = args.exp_name or default_exp_name(
+        args.model, args.quant_mode, split, args.lora_path
     )
     base = args.out_dir / exp_name
     base.mkdir(parents=True, exist_ok=True)
@@ -506,7 +575,7 @@ def main() -> int:
             model=args.model,
             backend={"hf_bnb": "hf_bnb", "llamacpp": "llamacpp",
                       "mock": "mock"}[args.backend],
-            quant_mode=args.quant_mode,
+            quant_mode=quant_label,  # LoRA: nf4_qlora，与零样本 nf4 严格隔离
             wer=wer["wer"], sub=wer["sub"], **{"del": wer["del"]},
             ins=wer["ins"],
             peak_vram_mb=stats["peak_vram_mb"],
