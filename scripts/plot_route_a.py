@@ -10,7 +10,12 @@
 
 用法：
     python scripts/analyze_route_a_cases.py   # 先生成改写率统计
-    python scripts/plot_route_a.py            # → docs/figures/*.svg
+    python scripts/plot_route_a.py            # → docs/figures/fig{1..5}_*.svg
+    python scripts/plot_route_a.py --png-check-dir /tmp/fig_check   # 附带 PNG 自检
+
+图号严格按 docs/ROUTE_A_REPORT.md 正文出现顺序：
+  fig1 WER 主对比 / fig2 QLoRA 收敛 / fig3 S/D/I 分化 /
+  fig4 三维权衡 / fig5 改写结构
 
 绘图规范：低饱和顶刊色板、内向刻度、细坐标轴、深色柱体描边、
 (a)/(b) 子图编号；图内不写解释性文字。
@@ -34,12 +39,13 @@ from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.patches import Patch  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
-PREVIEW = Path("/tmp/route_a_fig_preview")
-PREVIEW.mkdir(parents=True, exist_ok=True)
 sys.path.insert(0, str(REPO))
 
 from common.metrics import compute_wer  # noqa: E402
 from common.text_norm import normalize_for_wer  # noqa: E402
+
+# PNG 自检输出目录（默认不落盘；--png-check-dir 指定后启用）
+PNG_CHECK_DIR: Path | None = None
 
 # ---------------------------------------------------------------------------
 # 全局视觉规范
@@ -49,6 +55,7 @@ GRID = "#E5E7EB"
 AXIS = "#2B2D42"
 TEXT = "#1F2937"
 MUTED = "#6C757D"
+INSET_FRAME = "#CBD5E1"
 
 PALETTE = {
     "Beam-1": "#6C757D",        # 中性石板灰
@@ -129,6 +136,16 @@ def panel_label(ax, text: str, x: float = -0.02, y: float = 1.05) -> None:
         fontweight="bold",
         color=TEXT,
     )
+
+
+def save_fig(fig, path: Path, stem: str) -> Path:
+    """保存 SVG；若启用自检则同步渲染 200 DPI PNG 到独立目录。"""
+    fig.savefig(path, bbox_inches="tight")
+    if PNG_CHECK_DIR is not None:
+        PNG_CHECK_DIR.mkdir(parents=True, exist_ok=True)
+        fig.savefig(PNG_CHECK_DIR / f"{stem}.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -236,59 +253,21 @@ def fig1_wer_comparison(data, oracle, outdir: Path) -> Path:
             linewidth=0.6,
             zorder=3,
         )
-        for b, c, v in zip(bars, labels, vals):
-            if c == "NF4 + QLoRA":
-                # 末柱数值置于柱体内部，避免与右侧 Oracle 标签相撞
-                ax.text(
-                    b.get_x() + b.get_width() / 2,
-                    v - 0.22,
-                    f"{v:.2f}",
-                    ha="center",
-                    va="top",
-                    fontsize=8.0,
-                    color=BG,
-                )
-            else:
-                ax.text(
-                    b.get_x() + b.get_width() / 2,
-                    v + 0.035,
-                    f"{v:.2f}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=8.2,
-                    color=TEXT,
-                )
-
+        # 全部数值标签统一置于柱顶外侧正上方
         beam1 = vals[labels.index("Beam-1")]
-        ax.axhline(beam1, color=MUTED, linestyle=(0, (1, 1.6)), linewidth=0.9, zorder=2)
+        for b, c, v in zip(bars, labels, vals):
+            kw = dict(ha="center", va="bottom", fontsize=8.2, color=TEXT, zorder=6)
+            y = v + 0.035
+            # 参考线若落在标签字身区间，则将标签抬至线上方，杜绝压线
+            for ref in (beam1, orc):
+                if v + 0.015 < ref < v + 0.16:
+                    y = max(y, ref + 0.045)
+            # 参考线仅擦过柱顶（如 4.22 与 Oracle 4.25）时，加极窄纯白底避让
+            if any(v < ref <= v + 0.05 for ref in (beam1, orc)):
+                kw["bbox"] = dict(facecolor=BG, edgecolor="none", pad=0.6, alpha=0.9)
+            ax.text(b.get_x() + b.get_width() / 2, y, f"{v:.2f}", **kw)
 
-        # NF4 → NF4 + QLoRA 的下降标注
-        i_nf4, i_ql = labels.index("NF4"), labels.index("NF4 + QLoRA")
-        drop = vals[i_nf4] - vals[i_ql]
-        ax.annotate(
-            "",
-            xy=(xs[i_ql] - 0.30, vals[i_ql] + 0.10),
-            xytext=(xs[i_nf4] + 0.29, vals[i_nf4] + 0.10),
-            arrowprops=dict(
-                arrowstyle="-|>",
-                color=TEXT,
-                linewidth=0.8,
-                shrinkA=3,
-                shrinkB=3,
-                connectionstyle="arc3,rad=0.32",
-            ),
-            zorder=6,
-        )
-        ax.text(
-            (xs[i_nf4] + xs[i_ql]) / 2,
-            max(vals[i_nf4], vals[i_ql]) + 0.24,
-            f"−{drop:.2f}",
-            ha="center",
-            va="bottom",
-            fontsize=8.4,
-            color=TEXT,
-            zorder=7,
-        )
+        ax.axhline(beam1, color=MUTED, linestyle=(0, (1, 1.6)), linewidth=0.9, zorder=2)
 
         # 参考线标签置于右侧留白
         xr = len(labels) - 0.42
@@ -306,130 +285,137 @@ def fig1_wer_comparison(data, oracle, outdir: Path) -> Path:
         panel_label(ax, f"({'a' if idx == 0 else 'b'}) {split}", x=0.0, y=1.02)
         style_axes(ax)
 
-    handles = []
-    for c in CONFIG_ORDER:
-        handles.append(Patch(facecolor=PALETTE[c], edgecolor=AXIS, linewidth=0.6, label=c))
-    handles += [
+    # 柱体颜色已由 X 轴标签完整表达，底部仅保留参考线图例
+    handles = [
         Line2D([0], [0], color=MUTED, linestyle=(0, (1, 1.6)), linewidth=0.9, label="Beam-1 baseline"),
         Line2D([0], [0], color=ORACLE, linestyle=(0, (4, 2)), linewidth=0.9, label="Top-5 oracle"),
     ]
     fig.legend(
         handles=handles,
         loc="outside lower center",
-        ncol=5,
-        fontsize=7.9,
-        handlelength=1.4,
-        columnspacing=1.2,
+        ncol=2,
+        fontsize=8.0,
+        handlelength=1.8,
+        columnspacing=2.0,
     )
     path = outdir / "fig1_wer_comparison.svg"
-    fig.savefig(path, bbox_inches="tight")
-    fig.savefig(PREVIEW / "_preview_fig1.png", dpi=110, bbox_inches="tight")
-    plt.close(fig)
-    return path
+    return save_fig(fig, path, "fig1_wer_comparison")
 
 
 # ---------------------------------------------------------------------------
-# 图 2：D/I 对称分化 + I/D 比值双轴
+# 图 3：S/D/I 分化（上：I/D 比值，下：D / I 词数）
 # ---------------------------------------------------------------------------
-def fig2_sdi_divergence(data, outdir: Path) -> Path:
+def fig3_sdi_divergence(data, outdir: Path) -> Path:
     cfgs = ["FP16", "Q8_0", "NF4", "Q4_K_M", "NF4 + QLoRA"]
-    fig, axes = plt.subplots(1, 2, figsize=(11.2, 4.3), layout="constrained")
-    fig.get_layout_engine().set(w_pad=0.05, h_pad=0.03, wspace=0.10)
+    fig = plt.figure(figsize=(11.2, 5.6), layout="constrained")
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 2.2], hspace=0.08, wspace=0.12)
+    fig.get_layout_engine().set(w_pad=0.05, h_pad=0.03)
 
-    for idx, (ax, split) in enumerate(zip(axes, ("test-clean", "test-other"))):
+    for idx, split in enumerate(("test-clean", "test-other")):
+        ax_r = fig.add_subplot(gs[0, idx])
+        ax_b = fig.add_subplot(gs[1, idx], sharex=ax_r)
+
         labels = [c for c in cfgs if (split, c) in data]
         d = np.array([int(data[(split, c)]["del"]) for c in labels])
         i = np.array([int(data[(split, c)]["ins"]) for c in labels])
         xs = np.arange(len(labels))
+        ratio = i / np.maximum(d, 1)
         w = 0.34
 
-        bd = ax.bar(xs - w / 2, d, width=w, color=D_COLOR, edgecolor=AXIS, linewidth=0.6, zorder=3, label="Deletion")
-        bi = ax.bar(xs + w / 2, i, width=w, color=I_COLOR, edgecolor=AXIS, linewidth=0.6, zorder=3, label="Insertion")
+        # --- 上薄面板：I/D 比值 ---
+        ax_r.axhline(1.0, color=MUTED, linestyle=(0, (4, 2)), linewidth=0.8, zorder=1)
+        ax_r.plot(
+            xs,
+            ratio,
+            color=RATIO_COLOR,
+            marker="D",
+            markersize=5.2,
+            markerfacecolor=BG,
+            markeredgewidth=1.0,
+            linewidth=1.15,
+            zorder=4,
+        )
+        # 逐点标注：标签朝远离 I/D=1.0 参考线的一侧放置，避免压线
+        for x, r in zip(xs, ratio):
+            above = r >= 1.0
+            ax_r.text(
+                x,
+                r + 0.15 if above else r - 0.15,
+                f"{r:.2f}",
+                ha="center",
+                va="bottom" if above else "top",
+                fontsize=7.4,
+                color=RATIO_COLOR,
+                zorder=6,
+                bbox=dict(facecolor=BG, edgecolor="none", pad=0.4, alpha=0.9),
+            )
+        rlo, rhi = ratio.min(), ratio.max()
+        pad = (rhi - rlo) * 0.34 + 0.18
+        ax_r.set_ylim(max(0.0, rlo - pad), rhi + pad)
+        ax_r.set_ylabel("Insertion / Deletion", fontsize=8.6)
+        ax_r.set_yticks([0.5, 1.0, 1.5, 2.0, 2.5] if rhi > 1.8 else [0.5, 1.0, 1.5])
+        style_axes(ax_r)
+        ax_r.spines["bottom"].set_visible(False)
+        ax_r.tick_params(axis="x", which="both", bottom=False, labelbottom=False)
+        panel_label(ax_r, f"({'a' if idx == 0 else 'b'}) {split}", x=0.0, y=1.06)
+
+        # --- 下主面板：D / I 分组柱 ---
+        bd = ax_b.bar(xs - w / 2, d, width=w, color=D_COLOR, edgecolor=AXIS, linewidth=0.6, zorder=3)
+        bi = ax_b.bar(xs + w / 2, i, width=w, color=I_COLOR, edgecolor=AXIS, linewidth=0.6, zorder=3)
+        top = max(d.max(), i.max())
         for bars in (bd, bi):
             for b in bars:
                 h = b.get_height()
-                ax.text(
+                ax_b.text(
                     b.get_x() + b.get_width() / 2,
-                    h + max(d.max(), i.max()) * 0.015,
+                    h + top * 0.015,
                     f"{int(h)}",
                     ha="center",
                     va="bottom",
                     fontsize=7.6,
                     color=TEXT,
                 )
-
-        top = max(d.max(), i.max())
-        ax.set_ylim(0, top * 1.16)
-        ax.set_xticks(xs)
-        ax.set_xticklabels(
+        ax_b.set_ylim(0, top * 1.12)
+        ax_b.set_xticks(xs)
+        ax_b.set_xticklabels(
             [c.replace(" + ", "\n+ ") if c == "NF4 + QLoRA" else c for c in labels],
             fontsize=8.4,
         )
-        ax.set_ylabel("Error count (words)")
-        panel_label(ax, f"({'a' if idx == 0 else 'b'}) {split}", x=0.0, y=1.02)
-        style_axes(ax)
-
-        # 右侧次轴：I/D 比值
-        ax2 = ax.twinx()
-        ratio = i / np.maximum(d, 1)
-        ax2.plot(
-            xs,
-            ratio,
-            color=RATIO_COLOR,
-            marker="D",
-            markersize=5.0,
-            markerfacecolor=BG,
-            markeredgewidth=0.9,
-            linewidth=1.1,
-            zorder=5,
-            label="I/D ratio",
-        )
-        ax2.axhline(1.0, color=MUTED, linestyle=(0, (4, 2)), linewidth=0.8, zorder=1)
-        for x, r, c in zip(xs, ratio, labels):
-            if c in ("NF4", "Q4_K_M"):
-                ax2.text(x + 0.12, r, f"{r:.2f}", fontsize=6.9, color=RATIO_COLOR, va="center", ha="left")
-        ax2.set_ylim(0, 2.85 if split == "test-clean" else 2.05)
-        ax2.set_ylabel("Insertion / Deletion", color=RATIO_COLOR)
-        ax2.tick_params(axis="y", colors=RATIO_COLOR, direction="in", labelsize=8.2)
-        ax2.spines["right"].set_color(RATIO_COLOR)
-        ax2.spines["right"].set_linewidth(0.8)
-        ax2.spines["top"].set_visible(False)
-        ax2.spines["left"].set_visible(False)
+        ax_b.set_ylabel("Error count (words)", fontsize=8.6)
+        style_axes(ax_b)
 
     handles = [
         Patch(facecolor=D_COLOR, edgecolor=AXIS, linewidth=0.6, label="Deletion (D)"),
         Patch(facecolor=I_COLOR, edgecolor=AXIS, linewidth=0.6, label="Insertion (I)"),
-        Line2D([0], [0], color=RATIO_COLOR, marker="D", markerfacecolor=BG, markeredgewidth=0.9, linewidth=1.1, markersize=5.0, label="I/D ratio (right axis)"),
+        Line2D([0], [0], color=RATIO_COLOR, marker="D", markerfacecolor=BG, markeredgewidth=1.0,
+               linewidth=1.15, markersize=5.2, label="I/D ratio (upper)"),
         Line2D([0], [0], color=MUTED, linestyle=(0, (4, 2)), linewidth=0.8, label="I/D = 1.0"),
     ]
-    fig.legend(handles=handles, loc="outside lower center", ncol=4, fontsize=8.0, handlelength=1.5, columnspacing=1.3)
-    path = outdir / "fig2_sdi_divergence.svg"
-    fig.savefig(path, bbox_inches="tight")
-    fig.savefig(PREVIEW / "_preview_fig2.png", dpi=110, bbox_inches="tight")
-    plt.close(fig)
-    return path
+    fig.legend(handles=handles, loc="outside lower center", ncol=4, fontsize=8.0, handlelength=1.6, columnspacing=1.4)
+    path = outdir / "fig3_sdi_divergence.svg"
+    return save_fig(fig, path, "fig3_sdi_divergence")
 
 
 # ---------------------------------------------------------------------------
-# 图 3：3D 三维权衡空间
+# 图 4：3D 三维权衡空间
 # ---------------------------------------------------------------------------
-def fig3_3d_tradeoff(data, oracle, outdir: Path) -> Path:
+def fig4_3d_tradeoff(data, oracle, outdir: Path) -> Path:
     cfgs = ["FP16", "INT8", "Q8_0", "Q4_K_M", "NF4", "NF4 + QLoRA"]
     offs = {
         "test-clean": {
-            "FP16": ((9, 0), "left"),
-            "INT8": ((9, 2), "left"),
-            "Q8_0": ((-9, -3), "right"),
-            "Q4_K_M": ((-9, 4), "right"),
-            "NF4": ((-10, 6), "right"),
-            "NF4 + QLoRA": ((10, 0), "left"),
+            "FP16": ((10, 2), "left"),
+            "INT8": ((10, 2), "left"),
+            "Q8_0": ((-11, -4), "right"),
+            "Q4_K_M": ((-11, 5), "right"),
+            "NF4": ((-11, 8), "right"),
+            "NF4 + QLoRA": ((12, 1), "left"),
         },
         "test-other": {
-            "FP16": ((9, 0), "left"),
-            "Q8_0": ((-10, 1), "right"),
-            "Q4_K_M": ((-9, 5), "right"),
-            "NF4": ((-9, 6), "right"),
-            "NF4 + QLoRA": ((10, -2), "left"),
+            "FP16": ((10, 2), "left"),
+            "Q8_0": ((-12, 2), "right"),
+            "Q4_K_M": ((-11, 6), "right"),
+            "NF4": ((-11, 9), "right"),
+            "NF4 + QLoRA": ((12, -2), "left"),
         },
     }
     xr = (1.12, 3.62)
@@ -458,14 +444,9 @@ def fig3_3d_tradeoff(data, oracle, outdir: Path) -> Path:
             z = float(row["wer"]) * 100
             pts[c] = (x, y, z)
             col = PALETTE[c]
-            # 垂直落线 + 底面投影点
+            # 仅保留垂直落线 + 底面投影点（不向侧墙/后墙投影）
             ax.plot([x, x], [y, y], [zlo, z], color=col, linewidth=1.0, alpha=0.55, zorder=2)
             ax.scatter([x], [y], [zlo], color=col, s=15, alpha=0.40, edgecolors="none", depthshade=False)
-            # XZ 后墙（y = yr[0]）与 YZ 侧墙（x = xr[1]）的投影辅助
-            ax.plot([x, x], [y, yr[0]], [z, z], color=col, linestyle=(0, (1, 2)), linewidth=0.7, alpha=0.35, zorder=1)
-            ax.scatter([x], [yr[0]], [z], color=col, s=9, alpha=0.30, edgecolors="none", depthshade=False)
-            ax.plot([x, xr[1]], [y, y], [z, z], color=col, linestyle=(0, (1, 2)), linewidth=0.7, alpha=0.35, zorder=1)
-            ax.scatter([xr[1]], [y], [z], color=col, s=9, alpha=0.30, edgecolors="none", depthshade=False)
             ax.scatter([x], [y], [z], color=col, s=58, edgecolors=AXIS, linewidths=0.7, depthshade=False, zorder=5)
             pending.append((ax, c, x, y, z, *offs[split][c]))
 
@@ -496,6 +477,7 @@ def fig3_3d_tradeoff(data, oracle, outdir: Path) -> Path:
             axis.pane.set_alpha(1.0)
             axis._axinfo["grid"]["color"] = "#D8DCE2"
             axis._axinfo["grid"]["linewidth"] = 0.7
+            axis._axinfo["grid"]["alpha"] = 0.25
             axis.line.set_color(AXIS)
             axis.line.set_linewidth(0.8)
         ax.text2D(
@@ -525,25 +507,30 @@ def fig3_3d_tradeoff(data, oracle, outdir: Path) -> Path:
             va="center",
             annotation_clip=False,
             zorder=7,
+            bbox=dict(facecolor=BG, alpha=0.8, edgecolor="none", pad=0.8),
             arrowprops=dict(arrowstyle="-", color="#9CA3AF", linewidth=0.55, shrinkA=1, shrinkB=2),
         )
 
-    path = outdir / "fig3_3d_tradeoff.svg"
-    fig.savefig(path, bbox_inches="tight")
-    fig.savefig(PREVIEW / "_preview_fig3.png", dpi=110, bbox_inches="tight")
-    plt.close(fig)
-    return path
+    # 底部单行极简图例
+    handles = [
+        Line2D([0], [0], color=MUTED, linestyle=(0, (5, 3)), linewidth=1.1, label="Pareto frontier"),
+        Patch(facecolor=ORACLE, alpha=0.18, edgecolor="none", label="Top-5 Oracle plane"),
+    ]
+    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, -0.02), ncol=2, fontsize=8.2, handlelength=1.9, columnspacing=2.2)
+
+    path = outdir / "fig4_3d_tradeoff.svg"
+    return save_fig(fig, path, "fig4_3d_tradeoff")
 
 
 # ---------------------------------------------------------------------------
-# 图 4：QLoRA 收敛曲线 + inset zoom
+# 图 2：QLoRA 收敛曲线 + inset zoom
 # ---------------------------------------------------------------------------
-def fig4_qlora_training_loss(outdir: Path) -> Path:
+def fig2_qlora_training_loss(outdir: Path) -> Path:
     steps, losses, total = load_loss_curve()
     win = 25
     sx, mean, std = rolling_stats(steps, losses, win)
 
-    fig, ax = plt.subplots(figsize=(9.6, 4.3), layout="constrained")
+    fig, ax = plt.subplots(figsize=(9.0, 3.8), layout="constrained")
     ax.plot(steps, losses, color=PALETTE["INT8"], linewidth=0.45, alpha=0.22, zorder=1, label="Step loss")
     ax.fill_between(sx, mean - std, mean + std, color=PALETTE["FP16"], alpha=0.16, linewidth=0, zorder=2, label="±1 std")
     ax.plot(sx, mean, color=PALETTE["FP16"], linewidth=1.8, zorder=3, label="Moving average (w=25)")
@@ -551,47 +538,63 @@ def fig4_qlora_training_loss(outdir: Path) -> Path:
     half = total / 2.0
     ax.axvline(half, color=MUTED, linestyle=(0, (4, 2)), linewidth=0.8, zorder=1)
     ax.set_xlim(0, total)
-    ax.set_ylim(0, min(losses.max(), 1.0) * 1.05)
+    ax.set_ylim(0.0, 0.42)
     ax.set_xlabel("Optimizer step")
     ax.set_ylabel("Training loss")
     style_axes(ax)
 
-    # inset：尾部精细收敛（置于右上空白区，白底不透明）
-    axins = ax.inset_axes([0.44, 0.55, 0.45, 0.40])
-    m_tail = steps >= 800
-    axins.plot(steps[m_tail], losses[m_tail], color=PALETTE["INT8"], linewidth=0.4, alpha=0.25, zorder=1)
-    tail = sx >= 800
+    # Epoch 分界标签：虚线顶侧偏左
+    ax.text(
+        half - total * 0.010,
+        0.975,
+        "Epoch 1 | Epoch 2",
+        transform=ax.get_xaxis_transform(),
+        ha="right",
+        va="top",
+        fontsize=7.8,
+        color=MUTED,
+        zorder=6,
+    )
+
+    # inset：Epoch 2 收敛尾部，严格置于分界虚线右侧，纯白不透明
+    axins = ax.inset_axes([0.54, 0.54, 0.42, 0.40], zorder=10)
+    tail = sx >= 900
+    axins.plot(steps[steps >= 900], losses[steps >= 900], color=PALETTE["INT8"], linewidth=0.4, alpha=0.25, zorder=1)
     axins.fill_between(sx[tail], (mean - std)[tail], (mean + std)[tail], color=PALETTE["FP16"], alpha=0.16, linewidth=0, zorder=2)
     axins.plot(sx[tail], mean[tail], color=PALETTE["FP16"], linewidth=1.4, zorder=3)
-    axins.axvline(half, color=MUTED, linestyle=(0, (3, 2)), linewidth=0.7)
-    axins.set_xlim(800, total)
-    axins.set_ylim(0.0, 0.12)
-    axins.set_xticks([800, 1000, 1200, 1400, 1600, 1782])
+    axins.set_xlim(900, total)
+    axins.set_ylim(0.0, 0.13)
+    axins.set_xticks([1000, 1200, 1400, 1600])
     axins.set_yticks([0.0, 0.04, 0.08, 0.12])
-    axins.tick_params(labelsize=6.6, direction="in", colors=AXIS)
-    for side in ("top", "right"):
-        axins.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        axins.spines[side].set_color(AXIS)
-        axins.spines[side].set_linewidth(0.7)
+    axins.tick_params(labelsize=6.6, direction="in", colors=AXIS, pad=1.5)
+    for side in ("top", "right", "left", "bottom"):
+        axins.spines[side].set_visible(True)
+        axins.spines[side].set_color(INSET_FRAME)
+        axins.spines[side].set_linewidth(0.8)
     axins.set_facecolor(BG)
+    axins.patch.set_alpha(1.0)
+    # 末步标注：置于 inset 右下空白区，短引线不穿越滑动平均线
     axins.annotate(
-        f"final {losses[-1]:.3f}",
+        f"Final step: {losses[-1]:.3f}",
         xy=(steps[-1], losses[-1]),
-        xytext=(-74, 30),
+        xytext=(-6, -8),
         textcoords="offset points",
         fontsize=6.6,
         color=TEXT,
-        arrowprops=dict(arrowstyle="-", color="#9CA3AF", linewidth=0.6),
+        ha="right",
+        va="top",
+        zorder=11,
+        bbox=dict(facecolor=BG, edgecolor="none", pad=0.4, alpha=0.9),
+        arrowprops=dict(arrowstyle="-", color="#9CA3AF", linewidth=0.6, shrinkA=1, shrinkB=2),
     )
-    handles, labels = ax.get_legend_handles_labels()
-    ax.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, -0.24), ncol=3, fontsize=7.8, handlelength=1.6)
 
-    path = outdir / "fig4_qlora_training_loss.svg"
-    fig.savefig(path, bbox_inches="tight")
-    fig.savefig(PREVIEW / "_preview_fig4.png", dpi=110, bbox_inches="tight")
-    plt.close(fig)
-    return path
+    # 图例：Step loss 项加深可见度（仅图例内提升 alpha）
+    handles, labels = ax.get_legend_handles_labels()
+    handles[0].set_alpha(0.55)
+    ax.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, -0.30), ncol=3, fontsize=7.8, handlelength=1.6)
+
+    path = outdir / "fig2_qlora_training_loss.svg"
+    return save_fig(fig, path, "fig2_qlora_training_loss")
 
 
 # ---------------------------------------------------------------------------
@@ -625,8 +628,16 @@ def fig5_rewrite_analysis(stats, outdir: Path) -> Path:
     )
     fig.get_layout_engine().set(w_pad=0.04, hspace=0.03)
 
-    # (a) 水平堆叠条
-    ys = np.arange(len(rows))[::-1]
+    # (a) 水平堆叠条：clean / other 两组之间留 0.5 行距并加细分隔虚线
+    n_clean = sum(1 for r in rows if r["split"] == "test-clean")
+    ys = []
+    y_cur = (len(rows) + 0.5) - 1.0
+    for k, r in enumerate(rows):
+        if k == n_clean:
+            y_cur -= 0.5  # 组间额外间隔
+        ys.append(y_cur)
+        y_cur -= 1.0
+    ys = np.asarray(ys)
     left = np.zeros(len(rows))
     for key, col, name in (
         ("improved", GOOD, "Improved"),
@@ -639,6 +650,9 @@ def fig5_rewrite_analysis(stats, outdir: Path) -> Path:
             if v >= 0.07:
                 ax1.text(l + v / 2, y, f"{v * 100:.0f}", ha="center", va="center", fontsize=6.8, color=BG if key != "neutral" else TEXT)
         left += vals
+    # 组间极细浅灰水平虚线
+    y_sep = (ys[n_clean - 1] + ys[n_clean]) / 2.0
+    ax1.axhline(y_sep, color="#CBD5E1", linestyle=(0, (3, 3)), linewidth=0.7, zorder=2)
     ax1.set_yticks(ys)
     ax1.set_yticklabels([r["label"] for r in rows], fontsize=7.6)
     ax1.set_xlim(0, 1.0)
@@ -680,8 +694,8 @@ def fig5_rewrite_analysis(stats, outdir: Path) -> Path:
     ax2.set_yticklabels(cfgs, fontsize=7.6)
     ax2.set_ylim(-0.6, len(cfgs) - 0.4)
     ax2.set_xlabel("Mean per-utterance ΔWER (pts)")
-    xmax = max(abs(r["delta"]) for r in rows) * 1.42
-    ax2.set_xlim(-xmax, xmax)
+    ax2.set_xlim(-1.25, 2.75)
+    ax2.set_xticks([-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5])
     panel_label(ax2, "(b) Utterance-level gain", x=0.0, y=1.03)
     style_axes(ax2, grid_axis="x")
 
@@ -694,18 +708,23 @@ def fig5_rewrite_analysis(stats, outdir: Path) -> Path:
     ax2.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, -0.27), ncol=2, fontsize=7.4, handlelength=1.1, columnspacing=1.1)
 
     path = outdir / "fig5_rewrite_analysis.svg"
-    fig.savefig(path, bbox_inches="tight")
-    fig.savefig(PREVIEW / "_preview_fig5.png", dpi=110, bbox_inches="tight")
-    plt.close(fig)
-    return path
+    return save_fig(fig, path, "fig5_rewrite_analysis")
 
 
 def main() -> None:
+    global PNG_CHECK_DIR
     ap = argparse.ArgumentParser()
     ap.add_argument("--outdir", default=str(REPO / "docs" / "figures"))
+    ap.add_argument(
+        "--png-check-dir",
+        default=None,
+        help="额外渲染 200 DPI PNG 到该目录用于自检（不纳入版本控制）",
+    )
     args = ap.parse_args()
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+    if args.png_check_dir:
+        PNG_CHECK_DIR = Path(args.png_check_dir)
 
     setup_style()
     data = load_summary()
@@ -713,11 +732,12 @@ def main() -> None:
     stats = load_rewrite_stats()
     print("Oracle:", {k: round(v, 4) for k, v in oracle.items()})
 
+    # 图号严格对齐 docs/ROUTE_A_REPORT.md 正文出现顺序
     paths = [
         fig1_wer_comparison(data, oracle, outdir),
-        fig2_sdi_divergence(data, outdir),
-        fig3_3d_tradeoff(data, oracle, outdir),
-        fig4_qlora_training_loss(outdir),
+        fig2_qlora_training_loss(outdir),
+        fig3_sdi_divergence(data, outdir),
+        fig4_3d_tradeoff(data, oracle, outdir),
         fig5_rewrite_analysis(stats, outdir),
     ]
     for p in paths:

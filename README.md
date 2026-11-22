@@ -3,7 +3,7 @@
 > 小参数 LLM（Qwen3 系列，≤8B）在英文语音识别（LibriSpeech）中的**生成式纠错（GER）**与**多精度量化**研究：
 > 准确率—显存—延迟的三维权衡，以及端侧部署的可行性边界。
 
-本仓库为两阶段工程。**阶段一（路线 A）已完成闭环**；阶段二（路线 B）为规划中的端到端 Speech-LLM 扩展。
+本项目为两阶段研究。**阶段一（路线 A）已完成**；阶段二（路线 B）为规划中的端到端 Speech-LLM 扩展。
 
 | 阶段 | 路线 | 架构 | 状态 |
 |---|---|---|---|
@@ -25,7 +25,7 @@
 | Beam-1（声学基线） | 5.84 | 13.04 | pyctcdecode Top-1，无 LLM |
 | Top-5 Oracle（候选上界） | 4.25 | 11.16 | 逐句取 Top-5 最优候选 |
 | FP16（hf_bnb） | 5.22 | 11.70 | 全精度参考 |
-| INT8（hf_bnb） | 5.21 | — | test-other 因断电窗口跳过 |
+| INT8（hf_bnb） | 5.21 | — | test-other 未评测，见报告 §5.2 |
 | **Q8_0（llama.cpp）** | **5.21** | **11.76** | 端侧效率甜点 |
 | Q4_K_M（llama.cpp） | 5.99 | 12.96 | K-quant 激进档，质量受损 |
 | NF4（hf_bnb） | 6.10 | 13.08 | 4-bit 精度悬崖最明显 |
@@ -45,16 +45,16 @@
 **三条结论**：
 
 1. **4-bit 存在真实精度悬崖**：NF4 在 clean 集比 FP16 差 0.88 pts、在噪声集差 1.38 pts，且错误方向是**插入**（I=679/1017）而非替换。
-2. **两个 4-bit 后端错误方向相反**：NF4 偏插词（复读/加词），`Q4_K_M` 偏漏词（截断/粘连），在双集上对称复现（见 `fig2`）。
+2. **两个 4-bit 后端错误方向相反**：NF4 偏插词（复读/加词），`Q4_K_M` 偏漏词（截断/粘连），在双集上对称复现（见 `fig3`）。
 3. **Q8_0 是零样本帕累托最优**：WER 与 INT8 持平，但 RTF 快 14.5×、显存少 224 MB；相对 FP16 提速 3.5×（clean）–4.4×（other），显存少约 1.5 GB。
 4. **QLoRA 是唯一击穿 Oracle 的配置**：仅用 1.5 GB 推理显存，在 clean 集比 Oracle 低 0.03 pts、other 集低 0.44 pts。
 
 图表见 [`docs/figures/`](docs/figures/)（全部 SVG 矢量）：
 
 - `fig1_wer_comparison.svg` — 双集 WER 对比 + Beam-1 / Oracle 参考线与超越区
-- `fig2_sdi_divergence.svg` — 删除/插入错误的双集对称分化 + I/D 比值双轴
-- `fig3_3d_tradeoff.svg` — 显存 × 延迟 × 精度三维权衡空间（含帕累托前沿）
-- `fig4_qlora_training_loss.svg` — QLoRA 1782 步收敛曲线（±1 std 与尾部放大）
+- `fig2_qlora_training_loss.svg` — QLoRA 1782 步收敛曲线（±1 std 与 Epoch 2 尾部放大）
+- `fig3_sdi_divergence.svg` — 删除/插入错误的双集对称分化（上：I/D 比值，下：D/I 词数）
+- `fig4_3d_tradeoff.svg` — 显存 × 延迟 × 精度三维权衡空间（含帕累托前沿）
 - `fig5_rewrite_analysis.svg` — 改写结构堆叠图与句均 ΔWER 棒棒糖图
 
 ---
@@ -80,7 +80,7 @@ llm-asr-quant/
 ├── route_b_e2e/                 # 阶段二：端到端 Speech-LLM（未启动）
 ├── data/prepare_librispeech.py  # LibriSpeech 清单构建
 ├── scripts/
-│   ├── run_route_a_cloud.sh     # 魔搭 A10 一键流水线
+│   ├── run_route_a_cloud.sh     # A10 云端流水线
 │   ├── plot_route_a.py          # 论文级 SVG 图表复现脚本
 │   └── analyze_route_a_cases.py # 改写率统计 + 定性样本挑选
 ├── docs/
@@ -120,7 +120,7 @@ pip install --ignore-requires-python whisper-normalizer==1.0.1
 
 > **口径警告**：`whisper-normalizer` 0.1.x 会把所有格 `shelley's` 展开为 `shelley is`，
 > 1.0.x 输出 `shelleys`。两者 WER 相差约 0.10 pts，**混用会导致跨环境结果不可比**。
-> 本仓库所有数字统一为 **1.0.1**。
+> 本项目所有数字统一为 **1.0.1**。
 
 ### 3.3 离线与镜像
 
@@ -147,7 +147,7 @@ export TRANSFORMERS_OFFLINE=1
 
 ---
 
-## 5. 一键复现
+## 5. 复现流程
 
 ### 5.1 声学基线 + N-best 缓存
 
@@ -198,7 +198,7 @@ python route_a_ger/infer_ger.py --nbest outputs/nbest/test-clean.jsonl \
   --exp_name ger-Qwen3-1.7B-nf4_qlora-test-clean
 ```
 
-### 5.5 云端一键流水线
+### 5.5 云端流水线
 
 ```bash
 bash scripts/run_route_a_cloud.sh --stage download    # CPU 实例
