@@ -28,7 +28,13 @@ pyctcdecode>=0.5.0
 # [文本规范化与评测] Task 1.2
 # ----------------------------------------------------------------------------
 jiwer>=3.0
-whisper-normalizer>=0.2  # EnglishTextNormalizer
+# whisper-normalizer 1.0.1 为全仓库统一 WER 口径（英文 EnglishTextNormalizer）。
+#   1.0.1 的元数据声明 Requires-Python>=3.11，但代码本身兼容 3.10；
+#   本地 conda 环境为 Python 3.10，需跳过版本检查安装：
+#     pip install --ignore-requires-python whisper-normalizer==1.0.1
+#   0.1.x（如 0.1.15）会把所有格 shelley's 展开成 "shelley is"，与 1.0.x
+#   的 "shelleys" 口径相差约 0.10 pts WER，混用会导致跨环境结果不可比。
+whisper-normalizer==1.0.1  # EnglishTextNormalizer（py3.10 见上方 --ignore-requires-python 说明）
 
 # ----------------------------------------------------------------------------
 # [量化推理与微调] Task 1.4 / 1.6：bitsandbytes + QLoRA

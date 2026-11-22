@@ -811,8 +811,9 @@ class TestCheckpointResume:
         # WER 与 beam-1 基线一致（断言在 stdout 的 GER 结果行）
         line = [l for l in (r2.stdout + r2.stderr).splitlines() if "GER 结果" in l]
         assert line, "缺少 GER 结果日志行"
-        assert "WER=0.0904" in line[0]
-        assert "基线=0.0904" in line[0]
+        # whisper-normalizer 1.0.1 口径（0.1.15 时为 0.0904）
+        assert "WER=0.0900" in line[0]
+        assert "基线=0.0900" in line[0]
 
         # 统计口径：summary 的 total_infer_sec 应等于 Σgen_sec（毫秒级）
         rows = (out / "metrics" / "summary.csv").read_text().strip().splitlines()
