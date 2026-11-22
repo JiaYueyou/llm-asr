@@ -51,11 +51,11 @@
 
 图表见 [`docs/figures/`](docs/figures/)（全部 SVG 矢量）：
 
-- `fig1_wer_comparison.svg` — 双集 WER 对比 + Beam-1 / Oracle 参考线
-- `fig2_sdi_divergence.svg` — 删除/插入错误的双集对称分化
-- `fig3_3d_tradeoff.svg` — 显存 × 延迟 × 精度三维权衡空间
-- `fig4_qlora_training_loss.svg` — QLoRA 1782 步真实收敛曲线
-- `fig5_3d_sdi_landscape.svg` — S/D/I × 方法 × 数据集三维柱状矩阵
+- `fig1_wer_comparison.svg` — 双集 WER 对比 + Beam-1 / Oracle 参考线与超越区
+- `fig2_sdi_divergence.svg` — 删除/插入错误的双集对称分化 + I/D 比值双轴
+- `fig3_3d_tradeoff.svg` — 显存 × 延迟 × 精度三维权衡空间（含帕累托前沿）
+- `fig4_qlora_training_loss.svg` — QLoRA 1782 步收敛曲线（±1 std 与尾部放大）
+- `fig5_rewrite_analysis.svg` — 改写结构堆叠图与句均 ΔWER 棒棒糖图
 
 ---
 
@@ -213,8 +213,8 @@ bash scripts/run_route_a_cloud.sh --stage pack
 ### 5.6 图表与案例分析复现
 
 ```bash
-python scripts/plot_route_a.py            # → docs/figures/*.svg
 python scripts/analyze_route_a_cases.py   # → docs/route_a_analysis.json
+python scripts/plot_route_a.py            # → docs/figures/*.svg
 ```
 
 ---
