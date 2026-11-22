@@ -96,7 +96,9 @@ nohup bash scripts/run_route_a_cloud.sh --stage qlora \
 tail -f ${WORKSPACE_ROOT}/outputs/nohup-qlora.log
 ```
 
-- `Qwen3-1.7B` NF4 QLoRA，`template=plain`，等效 batch=32（8×4），2 epochs。
+- `Qwen3-1.7B` NF4 QLoRA，`template=plain`，等效 batch=32（4×8，微批更小以
+  降低 A10 上的激活峰值），2 epochs。每 epoch 步数 = `ceil(ceil(n/4)/8)`，
+  不足一个等效 batch 的尾部会强制 flush 成一步。
 - 自动检测 bf16：支持则 `--bf16`，否则回退 fp16。
 - 产物：`outputs/checkpoints/qwen3_1.7b_qlora_100h/`（adapter + summary JSON）。
 - 训练完成后自动在 `test-clean` / `test-other` 挂载评测：

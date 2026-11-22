@@ -9,7 +9,10 @@
     ``quilter is``、``don't→do not``、``0→zero``，与推理输出格式不一致）。
     WER 规范化只在评测阶段做；
   - Assistant-only loss：精确按 tokenizer 切分计算 prompt 长度，prompt 段
-    labels 全部置 -100，仅「目标转写 + EOS」参与 loss。
+    labels 全部置 -100，仅「目标转写 + EOS」参与 loss；
+  - 等效 batch = ``batch_size * grad_accum``；不 drop_last，epoch 末尾不足
+    一个等效 batch 的累积会**强制 flush 成一步**（loss 按实际微批数归一），
+    因此每 epoch 的 ``optimizer.step()`` 次数 = ceil(ceil(n/bs)/grad_accum)。
 
 显存（Qwen3-1.7B NF4 + r=16 + gradient checkpointing + batch=1）：
     ~1.2GB 量化权重 + 优化器/梯度 + 512 token 激活，本地 4.5GB 安全线内。
@@ -20,7 +23,7 @@
         --max_steps 15 --grad_accum 4 --max_seq_len 512 \
         --output_dir /tmp/qlora_smoke
 
-    # 云端 4090 正式训练（bf16 + 全量 N-best）
+    # 云端 A10 24G 正式训练（bf16 + 全量 N-best）
     python route_a_ger/train_qlora.py --nbest outputs/nbest/train-clean-100.jsonl \
         --model Qwen/Qwen3-1.7B --epochs 3 --bf16 \
         --output_dir outputs/qlora/ger-qwen3-1.7b-train-clean-100
@@ -178,6 +181,68 @@ def build_dataset(
 
 
 # ---------------------------------------------------------------------------
+# 步数规划（纯函数，便于 CPU 单测）
+# ---------------------------------------------------------------------------
+def micro_batches_per_epoch(n_examples: int, batch_size: int) -> int:
+    """每个 epoch 的 micro-batch 数（不 drop_last，尾部不足 batch_size 也算一批）。"""
+    if n_examples <= 0:
+        raise ValueError("n_examples 必须 > 0")
+    if batch_size < 1:
+        raise ValueError("batch_size 必须 >= 1")
+    return math.ceil(n_examples / batch_size)
+
+
+def steps_per_epoch(n_examples: int, batch_size: int, grad_accum: int) -> int:
+    """每个 epoch 的 ``optimizer.step()`` 次数（与训练循环严格一致）。
+
+    epoch 末尾不足 ``grad_accum`` 的累积会**强制 flush 成一步**（不 drop_last、
+    不丢梯度），故为 ``ceil(micro_batches / grad_accum)``；小样本场景下
+    ``len(examples) < batch_size * grad_accum`` 时结果恒 >= 1，不会除零。
+    """
+    if grad_accum < 1:
+        raise ValueError("grad_accum 必须 >= 1")
+    m = micro_batches_per_epoch(n_examples, batch_size)
+    return max(1, math.ceil(m / grad_accum))
+
+
+def micro_counts_per_epoch(
+    n_examples: int, batch_size: int, grad_accum: int
+) -> List[int]:
+    """每步实际累积的 micro-batch 数：前面的步为 ``grad_accum``，末步为余量。
+
+    该序列之和恒等于 ``micro_batches_per_epoch``，训练循环按此除 loss，
+    保证尾部 flush 步的梯度尺度与整步一致（不会被 grad_accum 除得过小）。
+    """
+    m = micro_batches_per_epoch(n_examples, batch_size)
+    n_steps = steps_per_epoch(n_examples, batch_size, grad_accum)
+    counts = [grad_accum] * (n_steps - 1)
+    counts.append(m - grad_accum * (n_steps - 1))
+    return counts
+
+
+def iter_step_targets(
+    n_examples: int,
+    batch_size: int,
+    grad_accum: int,
+    n_epochs: int,
+    total_steps: int,
+) -> List[int]:
+    """按 epoch 顺序给出每一步应累积的 micro-batch 数，共 ``total_steps`` 项。
+
+    训练循环直接消费该序列，因此 ``len(list(iter_step_targets(...)))`` 就是
+    实际 ``optimizer.step()`` 次数，与 scheduler 的 ``total_steps`` 严格一致。
+    """
+    counts = micro_counts_per_epoch(n_examples, batch_size, grad_accum)
+    targets: List[int] = []
+    for _ in range(max(0, n_epochs)):
+        for c in counts:
+            if len(targets) >= total_steps:
+                return targets
+            targets.append(c)
+    return targets
+
+
+# ---------------------------------------------------------------------------
 # 显存采样（nvidia-smi 进程级口径，后台线程）
 # ---------------------------------------------------------------------------
 class VramSampler(threading.Thread):
@@ -296,11 +361,22 @@ def train(args) -> int:
     from bitsandbytes.optim import PagedAdamW8bit
 
     optimizer = PagedAdamW8bit(trainable, lr=args.lr)
-    steps_per_epoch = max(1, len(examples) // args.grad_accum)
-    total_steps = args.max_steps or int(
-        math.ceil(steps_per_epoch * args.epochs)
-    )
+    # 每 epoch 的 optimizer.step() 次数：ceil(ceil(n/bs) / grad_accum)，尾部强制 flush
+    spe = steps_per_epoch(len(examples), args.batch_size, args.grad_accum)
+    total_steps = args.max_steps or int(math.ceil(spe * args.epochs))
     total_steps = max(1, total_steps)
+    # 轮数：max_steps 优先（可跨多轮取满，如 50 样本 / grad_accum=4 仅 12 步，
+    # 要跑 15 步需进入第 2 轮）；否则按 epochs（允许小数，向上取整）。
+    if args.max_steps:
+        n_epochs = max(1, math.ceil(total_steps / spe))
+    else:
+        n_epochs = max(1, math.ceil(args.epochs))
+    # 训练循环按该序列消费：其长度即真实 optimizer.step() 次数，
+    # 与 scheduler 的 total_steps 严格一致（不再依赖 micro 计数跨轮结转）。
+    step_targets = iter_step_targets(
+        len(examples), args.batch_size, args.grad_accum, n_epochs, total_steps
+    )
+    total_steps = len(step_targets)
     warmup = max(1, total_steps // 10)
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup, num_training_steps=total_steps
@@ -319,27 +395,26 @@ def train(args) -> int:
             yield collate_examples([examples[i] for i in idx], pad_id)
 
     step = 0
-    micro = 0
+    micro = 0          # 当前步已累积的 micro-batch 数
+    micro_target = 0   # 当前步应累积的 micro-batch 数（末步可能 < grad_accum）
     step_losses: List[float] = []
     accum_loss = 0.0
     t_train0 = time.perf_counter()
-    # 轮数：max_steps 优先（可跨多轮取满，如 50 样本 / grad_accum=4 仅 12 步，
-    # 要跑 15 步需进入第 2 轮）；否则按 epochs（允许小数，向上取整）。
-    if args.max_steps:
-        n_epochs = max(1, math.ceil(total_steps / steps_per_epoch))
-    else:
-        n_epochs = max(1, math.ceil(args.epochs))
     for _epoch in range(n_epochs):
         for batch in _epoch_batches():
+            if step >= total_steps:
+                break
+            if micro == 0:
+                micro_target = step_targets[step]
             batch = {k: v.to("cuda") for k, v in batch.items()}
             out = model(**batch)
             loss = out.loss
             if not torch.isfinite(loss):
                 raise RuntimeError(f"非有限 loss: {loss.item()}")
-            scaler.scale(loss / args.grad_accum).backward()
+            scaler.scale(loss / micro_target).backward()
             accum_loss += loss.item()
             micro += 1
-            if micro < args.grad_accum:
+            if micro < micro_target:
                 continue
 
             scaler.unscale_(optimizer)
@@ -350,7 +425,7 @@ def train(args) -> int:
             scheduler.step()
 
             step += 1
-            avg_loss = accum_loss / args.grad_accum
+            avg_loss = accum_loss / micro
             step_losses.append(avg_loss)
             accum_loss = 0.0
             micro = 0
@@ -361,8 +436,6 @@ def train(args) -> int:
                     "step %d/%d | loss=%.4f | ma3=%.4f | lr=%.2e",
                     step, total_steps, avg_loss, ma3, scheduler.get_last_lr()[0],
                 )
-            if step >= total_steps:
-                break
         if step >= total_steps:
             break
 
@@ -473,7 +546,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--fp16", action="store_true", help="fp16 计算精度（本地默认）"
     )
     dtype.add_argument(
-        "--bf16", action="store_true", help="bf16 计算精度（云端 4090 推荐）"
+        "--bf16", action="store_true", help="bf16 计算精度（云端 A10 推荐）"
     )
     return p
 

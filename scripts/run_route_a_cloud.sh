@@ -291,7 +291,7 @@ stage_nbest() {
 # stage: qlora —— 1.7B QLoRA 微调 + test-clean/test-other 挂载评测（GPU）
 # ---------------------------------------------------------------------------
 stage_qlora() {
-    echo "== [qlora] Qwen3-1.7B QLoRA（等效 batch=32, 2 epochs, template=plain）=="
+    echo "== [qlora] Qwen3-1.7B QLoRA（等效 batch=32, 4×8, 2 epochs, template=plain）=="
     # 本地模型目录：强制离线，避免 transformers 4.57 发 HEAD 请求假死
     export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
     require_file "${NBEST_DIR}/train-clean-100.jsonl"
@@ -303,8 +303,8 @@ stage_qlora() {
         --model "$QWEN_17" \
         --template plain \
         --epochs 2 \
-        --batch_size 8 \
-        --grad_accum 4 \
+        --batch_size 4 \
+        --grad_accum 8 \
         --max_seq_len 512 \
         --lr 2e-4 \
         --output_dir "$CKPT_DIR" \

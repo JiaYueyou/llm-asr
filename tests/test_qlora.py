@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -24,6 +25,10 @@ from route_a_ger.train_qlora import (  # noqa: E402
     build_target,
     collate_examples,
     encode_example,
+    iter_step_targets,
+    micro_batches_per_epoch,
+    micro_counts_per_epoch,
+    steps_per_epoch,
 )
 
 
@@ -137,3 +142,109 @@ class TestCollate:
         assert batch["input_ids"][0][-4:].tolist() == [0] * 4
         # 长样本无 padding，target 全部保留
         assert batch["labels"][1][-2:].tolist() == [ord("g"), ord("h")]
+
+
+def simulate_optimizer_steps(
+    n_examples: int,
+    batch_size: int,
+    grad_accum: int,
+    n_epochs: int,
+    total_steps: int,
+) -> tuple[int, int]:
+    """按 train() 的累积逻辑跑一遍（不涉及模型），返回 (step 次数, 消耗微批数)。
+
+    与训练循环同构：micro 达到当前步目标即 step；epoch 末尾不足目标也 flush。
+    """
+    targets = iter_step_targets(
+        n_examples, batch_size, grad_accum, n_epochs, total_steps
+    )
+    micro_per_epoch = micro_batches_per_epoch(n_examples, batch_size)
+    step = 0
+    micro = 0
+    micro_target = 0
+    consumed = 0
+    for _ in range(n_epochs):
+        for _b in range(micro_per_epoch):
+            if step >= total_steps:
+                return step, consumed
+            if micro == 0:
+                micro_target = targets[step]
+            consumed += 1
+            micro += 1
+            if micro < micro_target:
+                continue
+            step += 1
+            micro = 0
+    return step, consumed
+
+
+class TestStepsPerEpoch:
+    """步数规划必须与真实 optimizer.step() 次数严格一致。"""
+
+    @pytest.mark.parametrize(
+        "n, bs, ga",
+        [
+            (128, 4, 8),   # 整除：32 micro -> 4 步
+            (100, 4, 8),   # 非整除：25 micro -> 4 步（末步 1 micro）
+            (64, 8, 4),    # 整除（旧配置）
+            (60, 8, 4),    # 非整除：8 micro -> 2 步（末步 flush）
+            (7, 2, 3),     # 非整除 + 末步 flush
+        ],
+    )
+    def test_total_steps_match_optimizer_steps(self, n, bs, ga):
+        spe = steps_per_epoch(n, bs, ga)
+        m = micro_batches_per_epoch(n, bs)
+        assert m == math.ceil(n / bs)
+        assert spe == math.ceil(m / ga)
+
+        epochs = 3
+        total_steps = spe * epochs
+        steps, consumed = simulate_optimizer_steps(n, bs, ga, epochs, total_steps)
+        assert steps == total_steps
+        # 不 drop_last：每个 epoch 的全部微批都被消费
+        assert consumed == micro_batches_per_epoch(n, bs) * epochs
+
+    def test_micro_counts_sum_equals_micro_batches(self):
+        for n, bs, ga in [(128, 4, 8), (100, 4, 8), (7, 2, 3), (5, 1, 4)]:
+            counts = micro_counts_per_epoch(n, bs, ga)
+            assert len(counts) == steps_per_epoch(n, bs, ga)
+            assert sum(counts) == micro_batches_per_epoch(n, bs)
+            # 仅末步可能小于 grad_accum，其余均为 grad_accum
+            assert counts[:-1] == [ga] * (len(counts) - 1)
+            assert 1 <= counts[-1] <= ga
+
+    @pytest.mark.parametrize(
+        "n, bs, ga",
+        [
+            (3, 4, 8),   # 1 micro < 一个等效 batch
+            (1, 8, 4),
+            (7, 4, 8),
+            (1, 1, 1),
+        ],
+    )
+    def test_small_sample_no_zero_division(self, n, bs, ga):
+        spe = steps_per_epoch(n, bs, ga)
+        assert spe >= 1  # 不会出现 steps_per_epoch == 0
+
+        steps, consumed = simulate_optimizer_steps(n, bs, ga, 1, spe)
+        assert steps == spe == 1
+        assert consumed == micro_batches_per_epoch(n, bs)
+
+        # max_steps 模式下 n_epochs 由 ceil(total/spe) 推出，同样不能除零
+        n_epochs = max(1, math.ceil(spe / spe))
+        assert len(iter_step_targets(n, bs, ga, n_epochs, spe)) == spe
+
+    def test_max_steps_capped_exactly(self):
+        # 样本不足一整轮时，max_steps 模式可跨轮取满且不多跑
+        targets = iter_step_targets(5, 1, 4, n_epochs=3, total_steps=5)
+        assert len(targets) == 5
+        steps, _ = simulate_optimizer_steps(5, 1, 4, 3, 5)
+        assert steps == 5
+
+    def test_invalid_args_raise(self):
+        with pytest.raises(ValueError):
+            steps_per_epoch(0, 1, 1)
+        with pytest.raises(ValueError):
+            steps_per_epoch(10, 0, 1)
+        with pytest.raises(ValueError):
+            steps_per_epoch(10, 1, 0)
