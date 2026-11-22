@@ -1,0 +1,197 @@
+{
+  "stats": {
+    "test-clean": {
+      "FP16": {
+        "n": 2620,
+        "rewrite_rate": 0.4164,
+        "rewritten": 1091,
+        "improved": 538,
+        "worsened": 220,
+        "changed_neutral": 333,
+        "improve_share_of_rewrites": 0.4931,
+        "worsen_share_of_rewrites": 0.2016,
+        "mean_delta_wer_pts": 0.331
+      },
+      "INT8": {
+        "n": 2620,
+        "rewrite_rate": 0.4183,
+        "rewritten": 1096,
+        "improved": 539,
+        "worsened": 224,
+        "changed_neutral": 333,
+        "improve_share_of_rewrites": 0.4918,
+        "worsen_share_of_rewrites": 0.2044,
+        "mean_delta_wer_pts": 0.32
+      },
+      "Q8_0": {
+        "n": 2620,
+        "rewrite_rate": 0.416,
+        "rewritten": 1090,
+        "improved": 537,
+        "worsened": 223,
+        "changed_neutral": 330,
+        "improve_share_of_rewrites": 0.4927,
+        "worsen_share_of_rewrites": 0.2046,
+        "mean_delta_wer_pts": 0.377
+      },
+      "Q4_K_M": {
+        "n": 2620,
+        "rewrite_rate": 0.4187,
+        "rewritten": 1097,
+        "improved": 492,
+        "worsened": 293,
+        "changed_neutral": 312,
+        "improve_share_of_rewrites": 0.4485,
+        "worsen_share_of_rewrites": 0.2671,
+        "mean_delta_wer_pts": -0.611
+      },
+      "NF4": {
+        "n": 2620,
+        "rewrite_rate": 0.3767,
+        "rewritten": 987,
+        "improved": 465,
+        "worsened": 225,
+        "changed_neutral": 297,
+        "improve_share_of_rewrites": 0.4711,
+        "worsen_share_of_rewrites": 0.228,
+        "mean_delta_wer_pts": -0.758
+      },
+      "NF4 + QLoRA": {
+        "n": 2620,
+        "rewrite_rate": 0.4981,
+        "rewritten": 1305,
+        "improved": 789,
+        "worsened": 205,
+        "changed_neutral": 311,
+        "improve_share_of_rewrites": 0.6046,
+        "worsen_share_of_rewrites": 0.1571,
+        "mean_delta_wer_pts": 1.641
+      }
+    },
+    "test-other": {
+      "FP16": {
+        "n": 2939,
+        "rewrite_rate": 0.5461,
+        "rewritten": 1605,
+        "improved": 777,
+        "worsened": 210,
+        "changed_neutral": 618,
+        "improve_share_of_rewrites": 0.4841,
+        "worsen_share_of_rewrites": 0.1308,
+        "mean_delta_wer_pts": 1.117
+      },
+      "Q8_0": {
+        "n": 2939,
+        "rewrite_rate": 0.5396,
+        "rewritten": 1586,
+        "improved": 778,
+        "worsened": 211,
+        "changed_neutral": 597,
+        "improve_share_of_rewrites": 0.4905,
+        "worsen_share_of_rewrites": 0.133,
+        "mean_delta_wer_pts": 1.128
+      },
+      "Q4_K_M": {
+        "n": 2939,
+        "rewrite_rate": 0.5345,
+        "rewritten": 1571,
+        "improved": 673,
+        "worsened": 313,
+        "changed_neutral": 585,
+        "improve_share_of_rewrites": 0.4284,
+        "worsen_share_of_rewrites": 0.1992,
+        "mean_delta_wer_pts": -0.349
+      },
+      "NF4": {
+        "n": 2939,
+        "rewrite_rate": 0.4597,
+        "rewritten": 1351,
+        "improved": 567,
+        "worsened": 213,
+        "changed_neutral": 571,
+        "improve_share_of_rewrites": 0.4197,
+        "worsen_share_of_rewrites": 0.1577,
+        "mean_delta_wer_pts": -0.358
+      },
+      "NF4 + QLoRA": {
+        "n": 2939,
+        "rewrite_rate": 0.6621,
+        "rewritten": 1946,
+        "improved": 1032,
+        "worsened": 276,
+        "changed_neutral": 638,
+        "improve_share_of_rewrites": 0.5303,
+        "worsen_share_of_rewrites": 0.1418,
+        "mean_delta_wer_pts": 2.244
+      }
+    }
+  },
+  "cases": {
+    "NF4 插词 (test-clean)": [
+      {
+        "id": "61-70970-0014",
+        "ref": "presently he crossed the floor of his room with decided step",
+        "beam1": "presently he crossed the floor of his room with decided step",
+        "hyp": "presently he crossed the floor of his room with a decided step",
+        "w_beam1": 0.0,
+        "w_hyp": 0.0909,
+        "changed": true
+      }
+    ],
+    "Q4_K_M 截断 (test-clean)": [
+      {
+        "id": "121-127105-0007",
+        "ref": "to this his answer was prompt 0 thank god no and is the record yours",
+        "beam1": "to this his answer was prompt 0 thank god now and is the record yours",
+        "hyp": "0 thank god now and is the record yours",
+        "w_beam1": 0.0667,
+        "w_hyp": 0.4667,
+        "changed": true
+      }
+    ],
+    "QLoRA 跳出候选 (test-clean)": [
+      {
+        "id": "4507-16021-0015",
+        "ref": "since when has malady banished medicine",
+        "beam1": "since wen has malody banished medicine",
+        "hyp": "since when has malady banished medicine",
+        "w_beam1": 0.3333,
+        "w_hyp": 0.0,
+        "changed": true
+      }
+    ],
+    "QLoRA 跳出候选 (test-other)": [
+      {
+        "id": "2609-156975-0018",
+        "ref": "naturally he went to the land of midian",
+        "beam1": "naturaly he wentches the land of midian",
+        "hyp": "naturally he went to the land of midian",
+        "w_beam1": 0.375,
+        "w_hyp": 0.0,
+        "changed": true
+      }
+    ],
+    "NF4 复读 (test-other)": [
+      {
+        "id": "3997-180297-0007",
+        "ref": "is that really the only reason",
+        "beam1": "is that really the only reason",
+        "hyp": "is that really the only reason is that eally the only reason is tat really the only reason",
+        "w_beam1": 0.0,
+        "w_hyp": 1.0,
+        "changed": true
+      }
+    ],
+    "Q4_K_M 截断 (test-other)": [
+      {
+        "id": "1688-142285-0071",
+        "ref": "she put her hand to it and became ghastly pale",
+        "beam1": "she put her hand to it and became gosly pale",
+        "hyp": "ghostly pale",
+        "w_beam1": 0.1,
+        "w_hyp": 0.9,
+        "changed": true
+      }
+    ]
+  }
+}
